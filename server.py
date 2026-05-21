@@ -43,12 +43,17 @@ FIREBASE_STORAGE_BUCKET = os.getenv(
 firebase_app = None
 if FIREBASE_SERVICE_ACCOUNT_JSON:
     cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT_JSON))
-    firebase_app = firebase_admin.initialize_app(cred, {
-        "storageBucket": FIREBASE_STORAGE_BUCKET,
-    })
+    firebase_app = firebase_admin.initialize_app(
+        cred,
+        {
+            "storageBucket": FIREBASE_STORAGE_BUCKET,
+        },
+    )
     print(f"Firebase Admin SDK initialized with bucket: {FIREBASE_STORAGE_BUCKET}")
 else:
-    print("WARNING: FIREBASE_SERVICE_ACCOUNT_JSON not set in .env. HQ media upload disabled.")
+    print(
+        "WARNING: FIREBASE_SERVICE_ACCOUNT_JSON not set in .env. HQ media upload disabled."
+    )
 
 # Firestore client for reading follower relationships (unlock-post)
 firestore_db = fb_firestore.client() if firebase_app else None
@@ -57,9 +62,16 @@ firestore_db = fb_firestore.client() if firebase_app else None
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 if not ENCRYPTION_KEY:
     ENCRYPTION_KEY = Fernet.generate_key().decode()
-    print(f"WARNING: No ENCRYPTION_KEY in .env. Generated temporary key: {ENCRYPTION_KEY}")
-    print("Add this to your .env to persist across restarts: ENCRYPTION_KEY=" + ENCRYPTION_KEY)
-fernet = Fernet(ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY)
+    print(
+        f"WARNING: No ENCRYPTION_KEY in .env. Generated temporary key: {ENCRYPTION_KEY}"
+    )
+    print(
+        "Add this to your .env to persist across restarts: ENCRYPTION_KEY="
+        + ENCRYPTION_KEY
+    )
+fernet = Fernet(
+    ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY
+)
 
 
 def encrypt_url(url: str) -> str:
@@ -133,10 +145,10 @@ app = Flask(__name__)
 # ============================================================
 # GLAS Withdrawal Constants
 # ============================================================
-STABLE_TOKEN_USD_RATE = 1000       # 1000 stable tokens = $1
-WITHDRAWAL_FEE_PERCENT = 0.05      # 5% fee
-DAILY_WITHDRAWAL_CAP_USD = 50.0    # $50/day per user
-POOL_DRAIN_CAP_PERCENT = 0.10      # max 10% of pool per withdrawal
+STABLE_TOKEN_USD_RATE = 1000  # 1000 stable tokens = $1
+WITHDRAWAL_FEE_PERCENT = 0.05  # 5% fee
+DAILY_WITHDRAWAL_CAP_USD = 50.0  # $50/day per user
+POOL_DRAIN_CAP_PERCENT = 0.10  # max 10% of pool per withdrawal
 BURN_ADDRESS = "0x000000000000000000000000000000000000dEaD"
 
 # ============================================================
@@ -153,6 +165,7 @@ def compute_rank_score(likes_count, comments_count, created_at_seconds):
     Returns a float score.
     """
     import time
+
     engagement = likes_count + (comments_count * COMMENT_WEIGHT)
     now = time.time()
     age_hours = max(0, (now - created_at_seconds) / 3600.0)
@@ -166,6 +179,7 @@ def get_daily_withdrawal_usd(user_id: str) -> float:
         return 0.0
     try:
         from datetime import datetime, timedelta
+
         cutoff = datetime.utcnow() - timedelta(hours=24)
         withdrawals_ref = (
             firestore_db.collection("withdrawalHistory")
@@ -182,18 +196,25 @@ def get_daily_withdrawal_usd(user_id: str) -> float:
         return 0.0
 
 
-def record_withdrawal(user_id: str, usd_value: float, glas_amount: float, stable_burned: float):
+def record_withdrawal(
+    user_id: str, usd_value: float, glas_amount: float, stable_burned: float
+):
     """Log a withdrawal to Firestore."""
     if not firestore_db:
         return
     try:
         from datetime import datetime
-        firestore_db.collection("withdrawalHistory").document(user_id).collection("withdrawals").add({
-            "usdValue": usd_value,
-            "glasAmount": glas_amount,
-            "stableBurned": stable_burned,
-            "timestamp": datetime.utcnow(),
-        })
+
+        firestore_db.collection("withdrawalHistory").document(user_id).collection(
+            "withdrawals"
+        ).add(
+            {
+                "usdValue": usd_value,
+                "glasAmount": glas_amount,
+                "stableBurned": stable_burned,
+                "timestamp": datetime.utcnow(),
+            }
+        )
     except Exception as e:
         print(f"Error recording withdrawal: {e}")
 
@@ -227,14 +248,16 @@ def cancel_pending_transactions():
     to yourself for each pending nonce.
     """
     confirmed_nonce = w3.eth.get_transaction_count(account.address)
-    pending_nonce = w3.eth.get_transaction_count(account.address, 'pending')
+    pending_nonce = w3.eth.get_transaction_count(account.address, "pending")
 
     if pending_nonce > confirmed_nonce:
-        print(f"Found {pending_nonce - confirmed_nonce} pending transactions. Cancelling...")
+        print(
+            f"Found {pending_nonce - confirmed_nonce} pending transactions. Cancelling..."
+        )
 
-        latest_block = w3.eth.get_block('latest')
-        base_fee = latest_block['baseFeePerGas']
-        max_priority_fee = w3.to_wei(50, 'gwei')
+        latest_block = w3.eth.get_block("latest")
+        base_fee = latest_block["baseFeePerGas"]
+        max_priority_fee = w3.to_wei(50, "gwei")
         max_fee = (base_fee * 5) + max_priority_fee
 
         cancelled_txs = []
@@ -242,18 +265,20 @@ def cancel_pending_transactions():
         for nonce in range(confirmed_nonce, pending_nonce):
             try:
                 cancel_txn = {
-                    'from': account.address,
-                    'to': account.address,
-                    'value': 0,
-                    'gas': 21000,
-                    'maxFeePerGas': max_fee,
-                    'maxPriorityFeePerGas': max_priority_fee,
-                    'nonce': nonce,
-                    'chainId': w3.eth.chain_id,
+                    "from": account.address,
+                    "to": account.address,
+                    "value": 0,
+                    "gas": 21000,
+                    "maxFeePerGas": max_fee,
+                    "maxPriorityFeePerGas": max_priority_fee,
+                    "nonce": nonce,
+                    "chainId": w3.eth.chain_id,
                 }
 
                 signed_cancel = w3.eth.account.sign_transaction(cancel_txn, PRIVATE_KEY)
-                cancel_tx_hash = w3.eth.send_raw_transaction(signed_cancel.raw_transaction)
+                cancel_tx_hash = w3.eth.send_raw_transaction(
+                    signed_cancel.raw_transaction
+                )
                 cancelled_txs.append(cancel_tx_hash.hex())
                 print(f"Sent cancellation for nonce {nonce}: {cancel_tx_hash.hex()}")
 
@@ -348,9 +373,18 @@ def analyze_video(video_bytes):
         try:
             thumb_result = subprocess.run(
                 [
-                    "ffmpeg", "-i", input_path,
-                    "-ss", "1", "-frames:v", "1",
-                    "-f", "image2pipe", "-vcodec", "png", "pipe:1",
+                    "ffmpeg",
+                    "-i",
+                    input_path,
+                    "-ss",
+                    "1",
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "image2pipe",
+                    "-vcodec",
+                    "png",
+                    "pipe:1",
                 ],
                 capture_output=True,
                 timeout=30,
@@ -372,15 +406,25 @@ def analyze_video(video_bytes):
             audio_path = os.path.join(tmp_dir, "audio.mp3")
             audio_result = subprocess.run(
                 [
-                    "ffmpeg", "-i", input_path,
-                    "-vn", "-acodec", "libmp3lame", "-q:a", "5",
+                    "ffmpeg",
+                    "-i",
+                    input_path,
+                    "-vn",
+                    "-acodec",
+                    "libmp3lame",
+                    "-q:a",
+                    "5",
                     audio_path,
                 ],
                 capture_output=True,
                 text=True,
                 timeout=60,
             )
-            if audio_result.returncode == 0 and os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            if (
+                audio_result.returncode == 0
+                and os.path.exists(audio_path)
+                and os.path.getsize(audio_path) > 0
+            ):
                 with open(audio_path, "rb") as af:
                     transcription = openai_client.audio.transcriptions.create(
                         model="whisper-1",
@@ -483,11 +527,24 @@ def compress_video(file_bytes, target_height, max_fps=30, strip_metadata=False):
             f.write(file_bytes)
 
         cmd = [
-                "ffmpeg", "-y", "-i", input_path,
-                "-vf", f"scale=-2:{target_height}",
-                "-r", str(max_fps),
-                "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
+            "ffmpeg",
+            "-y",
+            "-i",
+            input_path,
+            "-vf",
+            f"scale=-2:{target_height}",
+            "-r",
+            str(max_fps),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
         ]
         if strip_metadata:
             cmd += ["-map_metadata", "-1"]
@@ -557,7 +614,12 @@ def pin_file_to_pinata(base64_image_str, media_type="photo"):
     return ipfs_url
 
 
-def pin_metadata_to_pinata(image_ipfs_url, token_name, description="Photo minted on AuthenSnap", media_type="photo"):
+def pin_metadata_to_pinata(
+    image_ipfs_url,
+    token_name,
+    description="Photo minted on AuthenSnap",
+    media_type="photo",
+):
     """
     Creates an ERC-721 metadata JSON with the image/video URL and pins it to Pinata.
     Returns the ipfs:// URI of the metadata JSON.
@@ -569,7 +631,9 @@ def pin_metadata_to_pinata(image_ipfs_url, token_name, description="Photo minted
       "image": "ipfs://QmImageHash"
     }
     """
-    gateway_url = image_ipfs_url.replace("ipfs://", "https://gateway.pinata.cloud/ipfs/")
+    gateway_url = image_ipfs_url.replace(
+        "ipfs://", "https://gateway.pinata.cloud/ipfs/"
+    )
     metadata = {
         "name": token_name,
         "description": description,
@@ -649,11 +713,11 @@ def extract_virtual_mint_token_id(receipt, contract):
 
 def get_gas_params():
     """Get aggressive EIP-1559 gas parameters."""
-    latest_block = w3.eth.get_block('latest')
-    base_fee = latest_block['baseFeePerGas']
-    max_priority_fee = w3.to_wei(30, 'gwei')
+    latest_block = w3.eth.get_block("latest")
+    base_fee = latest_block["baseFeePerGas"]
+    max_priority_fee = w3.to_wei(30, "gwei")
     max_fee = (base_fee * 5) + max_priority_fee
-    min_max_fee = w3.to_wei(600, 'gwei')
+    min_max_fee = w3.to_wei(600, "gwei")
     max_fee = max(max_fee, min_max_fee)
     return max_fee, max_priority_fee
 
@@ -661,14 +725,17 @@ def get_gas_params():
 def get_nonce():
     """Get nonce, cancelling pending transactions if needed."""
     confirmed_nonce = w3.eth.get_transaction_count(account.address)
-    pending_nonce = w3.eth.get_transaction_count(account.address, 'pending')
+    pending_nonce = w3.eth.get_transaction_count(account.address, "pending")
 
     if pending_nonce > confirmed_nonce:
-        print(f"WARNING: {pending_nonce - confirmed_nonce} pending transactions detected!")
+        print(
+            f"WARNING: {pending_nonce - confirmed_nonce} pending transactions detected!"
+        )
         cancel_pending_transactions()
         import time
+
         time.sleep(5)
-        return w3.eth.get_transaction_count(account.address, 'pending')
+        return w3.eth.get_transaction_count(account.address, "pending")
     return pending_nonce
 
 
@@ -708,7 +775,9 @@ def get_tokens(wallet_address):
             ).call()
             uri = contract.functions.tokenURI(token_id).call()
             image_url = resolve_image_from_token_uri(uri)
-            tokens.append({"tokenId": int(token_id), "tokenURI": image_url, "metadataURI": uri})
+            tokens.append(
+                {"tokenId": int(token_id), "tokenURI": image_url, "metadataURI": uri}
+            )
         except Exception as e:
             print(e)
             continue
@@ -730,16 +799,24 @@ def get_virtual_tokens(user_id):
             try:
                 uri = contract.functions.tokenURI(int(token_id)).call()
                 image_url = resolve_image_from_token_uri(uri)
-                tokens.append({"tokenId": int(token_id), "tokenURI": image_url, "metadataURI": uri})
+                tokens.append(
+                    {
+                        "tokenId": int(token_id),
+                        "tokenURI": image_url,
+                        "metadataURI": uri,
+                    }
+                )
             except Exception as e:
                 print(f"Error fetching URI for token {token_id}: {e}")
                 continue
 
-        return jsonify({
-            "userId": user_id,
-            "virtualBalance": len(tokens),
-            "tokens": tokens,
-        })
+        return jsonify(
+            {
+                "userId": user_id,
+                "virtualBalance": len(tokens),
+                "tokens": tokens,
+            }
+        )
     except Exception as e:
         print(e)
         return jsonify({"error": f"Error fetching virtual tokens: {e}"}), 500
@@ -752,11 +829,13 @@ def cancel_pending():
     """
     try:
         cancelled = cancel_pending_transactions()
-        return jsonify({
-            "success": True,
-            "cancelled_transactions": cancelled,
-            "count": len(cancelled)
-        })
+        return jsonify(
+            {
+                "success": True,
+                "cancelled_transactions": cancelled,
+                "count": len(cancelled),
+            }
+        )
     except Exception as e:
         print(e)
         return jsonify({"error": f"Error cancelling transactions: {e}"}), 500
@@ -786,7 +865,10 @@ def mint_nft():
     is_private = data.get("isPrivate", False)
 
     if not user_id and not wallet_address:
-        return jsonify({"error": "Missing userId or walletAddress in request body"}), 400
+        return (
+            jsonify({"error": "Missing userId or walletAddress in request body"}),
+            400,
+        )
 
     # 1. Compress media for IPFS (720p) and Firebase Storage (1080p)
     hq_media_url = None
@@ -794,7 +876,9 @@ def mint_nft():
     try:
         if media_type == "video":
             # 720p version for IPFS/NFT metadata (strip metadata for privacy)
-            lq_bytes = compress_video(raw_bytes, target_height=720, max_fps=30, strip_metadata=True)
+            lq_bytes = compress_video(
+                raw_bytes, target_height=720, max_fps=30, strip_metadata=True
+            )
             lq_base64 = base64.b64encode(lq_bytes).decode("utf-8")
             # 1080p version for Firebase Storage (HQ in-app display, keep metadata)
             hq_bytes = compress_video(raw_bytes, target_height=1080, max_fps=60)
@@ -812,7 +896,9 @@ def mint_nft():
     # 1a. Pin 720p version to IPFS
     try:
         image_ipfs_url = pin_file_to_pinata(lq_base64, media_type=media_type)
-        print(f"{'Video' if media_type == 'video' else 'Image'} (720p) uploaded to IPFS: {image_ipfs_url}")
+        print(
+            f"{'Video' if media_type == 'video' else 'Image'} (720p) uploaded to IPFS: {image_ipfs_url}"
+        )
     except Exception as e:
         print(e)
         return jsonify({"error": f"Error uploading to Pinata: {e}"}), 500
@@ -834,7 +920,9 @@ def mint_nft():
     # 3. Create and pin ERC-721 metadata JSON (so OpenSea shows the content)
     try:
         token_name = "AuthenSnap Video" if media_type == "video" else "AuthenSnap Photo"
-        metadata_ipfs_url = pin_metadata_to_pinata(image_ipfs_url, token_name, media_type=media_type)
+        metadata_ipfs_url = pin_metadata_to_pinata(
+            image_ipfs_url, token_name, media_type=media_type
+        )
         print(f"Metadata uploaded to IPFS: {metadata_ipfs_url}")
     except Exception as e:
         print(e)
@@ -854,13 +942,15 @@ def mint_nft():
             mint_fn = contract.get_function_by_signature("mint(address,string)")
             mint_fn = mint_fn(recipient, metadata_ipfs_url)
 
-        txn = mint_fn.build_transaction({
-            "chainId": w3.eth.chain_id,
-            "gas": 500000,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": max_priority_fee,
-            "nonce": nonce,
-        })
+        txn = mint_fn.build_transaction(
+            {
+                "chainId": w3.eth.chain_id,
+                "gas": 500000,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "nonce": nonce,
+            }
+        )
     except Exception as e:
         print(e)
         return jsonify({"error": f"Error building transaction: {e}"}), 500
@@ -874,12 +964,17 @@ def mint_nft():
             token_id = extract_token_id_from_receipt(receipt, contract)
     except Exception as e:
         print(f"Error details: {e}")
-        if 'tx_hash' in locals():
-            return jsonify({
-                "error": f"Transaction timeout or error: {e}",
-                "transaction_hash": tx_hash.hex(),
-                "check_status": f"https://sepolia.etherscan.io/tx/{tx_hash.hex()}"
-            }), 500
+        if "tx_hash" in locals():
+            return (
+                jsonify(
+                    {
+                        "error": f"Transaction timeout or error: {e}",
+                        "transaction_hash": tx_hash.hex(),
+                        "check_status": f"https://sepolia.etherscan.io/tx/{tx_hash.hex()}",
+                    }
+                ),
+                500,
+            )
         return jsonify({"error": f"Error sending transaction: {e}"}), 500
 
     # Upload 1080p HQ version to Firebase Storage (now that we have tokenId)
@@ -889,7 +984,9 @@ def mint_nft():
     else:
         ext = "jpg"
         content_type = "image/jpeg"
-    hq_media_url = upload_to_firebase_storage(hq_bytes, f"{token_id}.{ext}", content_type)
+    hq_media_url = upload_to_firebase_storage(
+        hq_bytes, f"{token_id}.{ext}", content_type
+    )
     if hq_media_url:
         print(f"HQ media (1080p) uploaded to Firebase Storage: {hq_media_url}")
 
@@ -958,17 +1055,24 @@ def unlock_post():
 
         if not is_private:
             # Not private, return URLs as-is (they're not encrypted)
-            return jsonify({
-                "ipfsUrl": post_data.get("ipfsUrl", ""),
-                "hqMediaUrl": post_data.get("hqMediaUrl", ""),
-            })
+            return jsonify(
+                {
+                    "ipfsUrl": post_data.get("ipfsUrl", ""),
+                    "hqMediaUrl": post_data.get("hqMediaUrl", ""),
+                }
+            )
 
         # Check authorization: owner or follower
         is_owner = viewer_id == owner_id
         is_follower = False
 
         if not is_owner:
-            follower_ref = firestore_db.collection("users").document(owner_id).collection("followers").document(viewer_id)
+            follower_ref = (
+                firestore_db.collection("users")
+                .document(owner_id)
+                .collection("followers")
+                .document(viewer_id)
+            )
             follower_doc = follower_ref.get()
             is_follower = follower_doc.exists
 
@@ -994,10 +1098,12 @@ def unlock_post():
         except Exception:
             decrypted_hq = encrypted_hq
 
-        return jsonify({
-            "ipfsUrl": decrypted_ipfs,
-            "hqMediaUrl": decrypted_hq,
-        })
+        return jsonify(
+            {
+                "ipfsUrl": decrypted_ipfs,
+                "hqMediaUrl": decrypted_hq,
+            }
+        )
 
     except Exception as e:
         print(f"Unlock post error: {e}")
@@ -1011,7 +1117,12 @@ def export_token():
     Body: { userId, tokenId, toAddress }
     """
     data = request.get_json()
-    if not data or "userId" not in data or "tokenId" not in data or "toAddress" not in data:
+    if (
+        not data
+        or "userId" not in data
+        or "tokenId" not in data
+        or "toAddress" not in data
+    ):
         return jsonify({"error": "Missing userId, tokenId, or toAddress"}), 400
 
     user_id = data["userId"]
@@ -1029,23 +1140,27 @@ def export_token():
         max_fee, max_priority_fee = get_gas_params()
 
         export_fn = contract.functions.exportToken(user_id_hash, token_id, recipient)
-        txn = export_fn.build_transaction({
-            "chainId": w3.eth.chain_id,
-            "gas": 200000,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": max_priority_fee,
-            "nonce": nonce,
-        })
+        txn = export_fn.build_transaction(
+            {
+                "chainId": w3.eth.chain_id,
+                "gas": 200000,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "nonce": nonce,
+            }
+        )
 
         tx_hash, receipt = send_transaction(txn)
 
-        return jsonify({
-            "success": True,
-            "transaction_hash": tx_hash.hex(),
-            "token_id": token_id,
-            "exported_to": recipient,
-            "receipt": make_json_serializable(receipt),
-        })
+        return jsonify(
+            {
+                "success": True,
+                "transaction_hash": tx_hash.hex(),
+                "token_id": token_id,
+                "exported_to": recipient,
+                "receipt": make_json_serializable(receipt),
+            }
+        )
     except Exception as e:
         print(f"Export error: {e}")
         return jsonify({"error": f"Error exporting token: {e}"}), 500
@@ -1058,7 +1173,12 @@ def transfer_post():
     Body: { fromUserId, toUserId, tokenId }
     """
     data = request.get_json()
-    if not data or "fromUserId" not in data or "toUserId" not in data or "tokenId" not in data:
+    if (
+        not data
+        or "fromUserId" not in data
+        or "toUserId" not in data
+        or "tokenId" not in data
+    ):
         return jsonify({"error": "Missing fromUserId, toUserId, or tokenId"}), 400
 
     from_user_id = data["fromUserId"]
@@ -1072,24 +1192,28 @@ def transfer_post():
         max_fee, max_priority_fee = get_gas_params()
 
         transfer_fn = contract.functions.transferVirtual(from_hash, to_hash, token_id)
-        txn = transfer_fn.build_transaction({
-            "chainId": w3.eth.chain_id,
-            "gas": 200000,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": max_priority_fee,
-            "nonce": nonce,
-        })
+        txn = transfer_fn.build_transaction(
+            {
+                "chainId": w3.eth.chain_id,
+                "gas": 200000,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "nonce": nonce,
+            }
+        )
 
         tx_hash, receipt = send_transaction(txn)
 
-        return jsonify({
-            "success": True,
-            "transaction_hash": tx_hash.hex(),
-            "token_id": token_id,
-            "from_user_id": from_user_id,
-            "to_user_id": to_user_id,
-            "receipt": make_json_serializable(receipt),
-        })
+        return jsonify(
+            {
+                "success": True,
+                "transaction_hash": tx_hash.hex(),
+                "token_id": token_id,
+                "from_user_id": from_user_id,
+                "to_user_id": to_user_id,
+                "receipt": make_json_serializable(receipt),
+            }
+        )
     except Exception as e:
         print(f"Transfer error: {e}")
         return jsonify({"error": f"Error transferring post: {e}"}), 500
@@ -1115,23 +1239,27 @@ def import_token():
         max_fee, max_priority_fee = get_gas_params()
 
         import_fn = contract.functions.importToken(user_id_hash, token_id)
-        txn = import_fn.build_transaction({
-            "chainId": w3.eth.chain_id,
-            "gas": 200000,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": max_priority_fee,
-            "nonce": nonce,
-        })
+        txn = import_fn.build_transaction(
+            {
+                "chainId": w3.eth.chain_id,
+                "gas": 200000,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "nonce": nonce,
+            }
+        )
 
         tx_hash, receipt = send_transaction(txn)
 
-        return jsonify({
-            "success": True,
-            "transaction_hash": tx_hash.hex(),
-            "token_id": token_id,
-            "user_id": user_id,
-            "receipt": make_json_serializable(receipt),
-        })
+        return jsonify(
+            {
+                "success": True,
+                "transaction_hash": tx_hash.hex(),
+                "token_id": token_id,
+                "user_id": user_id,
+                "receipt": make_json_serializable(receipt),
+            }
+        )
     except Exception as e:
         print(f"Import error: {e}")
         return jsonify({"error": f"Error importing token: {e}"}), 500
@@ -1164,22 +1292,28 @@ def create_account():
         nonce = get_nonce()
         max_fee, max_priority_fee = get_gas_params()
 
-        txn = token_contract.functions.mintToVirtual(user_id_hash, amount).build_transaction({
-            "chainId": w3.eth.chain_id,
-            "gas": 200000,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": max_priority_fee,
-            "nonce": nonce,
-        })
+        txn = token_contract.functions.mintToVirtual(
+            user_id_hash, amount
+        ).build_transaction(
+            {
+                "chainId": w3.eth.chain_id,
+                "gas": 200000,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "nonce": nonce,
+            }
+        )
 
         tx_hash, receipt = send_transaction(txn)
 
-        return jsonify({
-            "success": True,
-            "userId": user_id,
-            "tokensGranted": 10000,
-            "transaction_hash": tx_hash.hex(),
-        })
+        return jsonify(
+            {
+                "success": True,
+                "userId": user_id,
+                "tokensGranted": 10000,
+                "transaction_hash": tx_hash.hex(),
+            }
+        )
     except Exception as e:
         print(f"Create account error: {e}")
         return jsonify({"error": f"Error creating account: {e}"}), 500
@@ -1199,10 +1333,12 @@ def get_token_balance(user_id):
         balance_wei = token_contract.functions.getVirtualBalance(user_id_hash).call()
         balance = w3.from_wei(balance_wei, "ether")
 
-        return jsonify({
-            "userId": user_id,
-            "balance": float(balance),
-        })
+        return jsonify(
+            {
+                "userId": user_id,
+                "balance": float(balance),
+            }
+        )
     except Exception as e:
         print(f"Token balance error: {e}")
         return jsonify({"error": f"Error fetching token balance: {e}"}), 500
@@ -1231,22 +1367,28 @@ def sync_token_balance():
         nonce = get_nonce()
         max_fee, max_priority_fee = get_gas_params()
 
-        txn = token_contract.functions.mintToVirtual(user_id_hash, amount_wei).build_transaction({
-            "chainId": w3.eth.chain_id,
-            "gas": 200000,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": max_priority_fee,
-            "nonce": nonce,
-        })
+        txn = token_contract.functions.mintToVirtual(
+            user_id_hash, amount_wei
+        ).build_transaction(
+            {
+                "chainId": w3.eth.chain_id,
+                "gas": 200000,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "nonce": nonce,
+            }
+        )
 
         tx_hash, receipt = send_transaction(txn)
 
-        return jsonify({
-            "success": True,
-            "userId": user_id,
-            "additionalAmount": additional_amount,
-            "transaction_hash": tx_hash.hex(),
-        })
+        return jsonify(
+            {
+                "success": True,
+                "userId": user_id,
+                "additionalAmount": additional_amount,
+                "transaction_hash": tx_hash.hex(),
+            }
+        )
     except Exception as e:
         print(f"Sync token balance error: {e}")
         return jsonify({"error": f"Error syncing token balance: {e}"}), 500
@@ -1274,21 +1416,25 @@ def set_glas_price():
         nonce = get_nonce()
         max_fee, max_priority_fee = get_gas_params()
 
-        txn = glas_contract.functions.setPrice(price_wei).build_transaction({
-            "chainId": w3.eth.chain_id,
-            "gas": 100000,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": max_priority_fee,
-            "nonce": nonce,
-        })
+        txn = glas_contract.functions.setPrice(price_wei).build_transaction(
+            {
+                "chainId": w3.eth.chain_id,
+                "gas": 100000,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "nonce": nonce,
+            }
+        )
 
         tx_hash, receipt = send_transaction(txn)
 
-        return jsonify({
-            "success": True,
-            "priceUsd": price_usd,
-            "transaction_hash": tx_hash.hex(),
-        })
+        return jsonify(
+            {
+                "success": True,
+                "priceUsd": price_usd,
+                "transaction_hash": tx_hash.hex(),
+            }
+        )
     except Exception as e:
         print(f"Set GLAS price error: {e}")
         return jsonify({"error": f"Error setting GLAS price: {e}"}), 500
@@ -1343,15 +1489,17 @@ def get_withdrawal_info(user_id):
 
         max_single_glas = pool_balance * POOL_DRAIN_CAP_PERCENT
 
-        return jsonify({
-            "dailyCapUsd": DAILY_WITHDRAWAL_CAP_USD,
-            "withdrawnTodayUsd": withdrawn_today,
-            "remainingUsd": remaining_usd,
-            "glasPriceUsd": glas_price_usd,
-            "feePercent": WITHDRAWAL_FEE_PERCENT,
-            "maxSingleWithdrawalGlas": max_single_glas,
-            "poolBalance": pool_balance,
-        })
+        return jsonify(
+            {
+                "dailyCapUsd": DAILY_WITHDRAWAL_CAP_USD,
+                "withdrawnTodayUsd": withdrawn_today,
+                "remainingUsd": remaining_usd,
+                "glasPriceUsd": glas_price_usd,
+                "feePercent": WITHDRAWAL_FEE_PERCENT,
+                "maxSingleWithdrawalGlas": max_single_glas,
+                "poolBalance": pool_balance,
+            }
+        )
     except Exception as e:
         print(f"Withdrawal info error: {e}")
         return jsonify({"error": f"Error fetching withdrawal info: {e}"}), 500
@@ -1411,36 +1559,54 @@ def withdraw_tokens():
         already_withdrawn = get_daily_withdrawal_usd(user_id)
         if already_withdrawn + net_usd > DAILY_WITHDRAWAL_CAP_USD:
             remaining = max(0, DAILY_WITHDRAWAL_CAP_USD - already_withdrawn)
-            return jsonify({
-                "error": f"Daily withdrawal cap exceeded. Remaining today: ${remaining:.2f}",
-                "remainingUsd": remaining,
-            }), 400
+            return (
+                jsonify(
+                    {
+                        "error": f"Daily withdrawal cap exceeded. Remaining today: ${remaining:.2f}",
+                        "remainingUsd": remaining,
+                    }
+                ),
+                400,
+            )
 
         # 5. Guardrail 2: pool cap
         pool_balance_wei = glas_contract.functions.getPoolBalance().call()
         pool_balance = float(w3.from_wei(pool_balance_wei, "ether"))
         max_glas = pool_balance * POOL_DRAIN_CAP_PERCENT
         if glas_amount > max_glas:
-            return jsonify({
-                "error": f"Withdrawal exceeds pool drain cap ({POOL_DRAIN_CAP_PERCENT*100:.0f}% of pool). Max: {max_glas:.2f} GLAS",
-                "maxGlas": max_glas,
-            }), 400
+            return (
+                jsonify(
+                    {
+                        "error": f"Withdrawal exceeds pool drain cap ({POOL_DRAIN_CAP_PERCENT*100:.0f}% of pool). Max: {max_glas:.2f} GLAS",
+                        "maxGlas": max_glas,
+                    }
+                ),
+                400,
+            )
 
         # 6. Sync stable token on-chain if needed
         stable_amount_wei = w3.to_wei(stable_amount, "ether")
-        on_chain_balance_wei = token_contract.functions.getVirtualBalance(user_id_hash).call()
+        on_chain_balance_wei = token_contract.functions.getVirtualBalance(
+            user_id_hash
+        ).call()
         if on_chain_balance_wei < stable_amount_wei:
             deficit_wei = stable_amount_wei - on_chain_balance_wei
-            print(f"Syncing {w3.from_wei(deficit_wei, 'ether')} stable tokens on-chain first.")
+            print(
+                f"Syncing {w3.from_wei(deficit_wei, 'ether')} stable tokens on-chain first."
+            )
             nonce = get_nonce()
             max_fee, max_priority_fee = get_gas_params()
-            sync_txn = token_contract.functions.mintToVirtual(user_id_hash, deficit_wei).build_transaction({
-                "chainId": w3.eth.chain_id,
-                "gas": 200000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            })
+            sync_txn = token_contract.functions.mintToVirtual(
+                user_id_hash, deficit_wei
+            ).build_transaction(
+                {
+                    "chainId": w3.eth.chain_id,
+                    "gas": 200000,
+                    "maxFeePerGas": max_fee,
+                    "maxPriorityFeePerGas": max_priority_fee,
+                    "nonce": nonce,
+                }
+            )
             send_transaction(sync_txn)
 
         # 7. Burn stable tokens by exporting to burn address
@@ -1448,26 +1614,32 @@ def withdraw_tokens():
         max_fee, max_priority_fee = get_gas_params()
         burn_txn = token_contract.functions.exportTokens(
             user_id_hash, stable_amount_wei, Web3.to_checksum_address(BURN_ADDRESS)
-        ).build_transaction({
-            "chainId": w3.eth.chain_id,
-            "gas": 200000,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": max_priority_fee,
-            "nonce": nonce,
-        })
+        ).build_transaction(
+            {
+                "chainId": w3.eth.chain_id,
+                "gas": 200000,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "nonce": nonce,
+            }
+        )
         send_transaction(burn_txn)
 
         # 8. Credit GLAS from pool to user virtual wallet
         glas_amount_wei = w3.to_wei(glas_amount, "ether")
         nonce = get_nonce()
         max_fee, max_priority_fee = get_gas_params()
-        credit_txn = glas_contract.functions.creditFromPool(user_id_hash, glas_amount_wei).build_transaction({
-            "chainId": w3.eth.chain_id,
-            "gas": 200000,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": max_priority_fee,
-            "nonce": nonce,
-        })
+        credit_txn = glas_contract.functions.creditFromPool(
+            user_id_hash, glas_amount_wei
+        ).build_transaction(
+            {
+                "chainId": w3.eth.chain_id,
+                "gas": 200000,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "nonce": nonce,
+            }
+        )
         send_transaction(credit_txn)
 
         # 9. (Optional) Export GLAS to real address
@@ -1477,13 +1649,15 @@ def withdraw_tokens():
             max_fee, max_priority_fee = get_gas_params()
             export_txn = glas_contract.functions.exportTokens(
                 user_id_hash, glas_amount_wei, recipient
-            ).build_transaction({
-                "chainId": w3.eth.chain_id,
-                "gas": 200000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            })
+            ).build_transaction(
+                {
+                    "chainId": w3.eth.chain_id,
+                    "gas": 200000,
+                    "maxFeePerGas": max_fee,
+                    "maxPriorityFeePerGas": max_priority_fee,
+                    "nonce": nonce,
+                }
+            )
             export_hash, _ = send_transaction(export_txn)
             export_tx_hash = export_hash.hex()
 
@@ -1558,22 +1732,26 @@ def burn_nft():
         max_fee, max_priority_fee = get_gas_params()
 
         burn_fn = contract.functions.burnVirtual(user_id_hash, token_id)
-        txn = burn_fn.build_transaction({
-            "chainId": w3.eth.chain_id,
-            "gas": 200000,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": max_priority_fee,
-            "nonce": nonce,
-        })
+        txn = burn_fn.build_transaction(
+            {
+                "chainId": w3.eth.chain_id,
+                "gas": 200000,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "nonce": nonce,
+            }
+        )
 
         tx_hash, receipt = send_transaction(txn)
 
-        return jsonify({
-            "success": True,
-            "transaction_hash": tx_hash.hex(),
-            "token_id": token_id,
-            "receipt": make_json_serializable(receipt),
-        })
+        return jsonify(
+            {
+                "success": True,
+                "transaction_hash": tx_hash.hex(),
+                "token_id": token_id,
+                "receipt": make_json_serializable(receipt),
+            }
+        )
     except Exception as e:
         print(f"Burn error: {e}")
         return jsonify({"error": f"Error burning token: {e}"}), 500
@@ -1611,13 +1789,15 @@ def remint_post():
         max_fee, max_priority_fee = get_gas_params()
 
         mint_fn = contract.functions.mintToVirtual(user_id_hash, metadata_ipfs_url)
-        txn = mint_fn.build_transaction({
-            "chainId": w3.eth.chain_id,
-            "gas": 500000,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": max_priority_fee,
-            "nonce": nonce,
-        })
+        txn = mint_fn.build_transaction(
+            {
+                "chainId": w3.eth.chain_id,
+                "gas": 500000,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "nonce": nonce,
+            }
+        )
 
         tx_hash, receipt = send_transaction(txn)
         new_token_id = extract_virtual_mint_token_id(receipt, contract)
@@ -1630,15 +1810,17 @@ def remint_post():
             if hq_media_url:
                 returned_hq_url = encrypt_url(hq_media_url)
 
-        return jsonify({
-            "success": True,
-            "token_id": new_token_id,
-            "ipfs_uri": returned_ipfs_url,
-            "metadata_uri": metadata_ipfs_url,
-            "hqMediaUrl": returned_hq_url,
-            "isPrivate": is_private,
-            "transaction_hash": tx_hash.hex(),
-        })
+        return jsonify(
+            {
+                "success": True,
+                "token_id": new_token_id,
+                "ipfs_uri": returned_ipfs_url,
+                "metadata_uri": metadata_ipfs_url,
+                "hqMediaUrl": returned_hq_url,
+                "isPrivate": is_private,
+                "transaction_hash": tx_hash.hex(),
+            }
+        )
     except Exception as e:
         print(f"Remint error: {e}")
         return jsonify({"error": f"Error reminting post: {e}"}), 500
@@ -1695,13 +1877,15 @@ def toggle_privacy():
             max_fee, max_priority_fee = get_gas_params()
 
             burn_fn = contract.functions.burnVirtual(user_id_hash, old_token_id)
-            burn_txn = burn_fn.build_transaction({
-                "chainId": w3.eth.chain_id,
-                "gas": 200000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            })
+            burn_txn = burn_fn.build_transaction(
+                {
+                    "chainId": w3.eth.chain_id,
+                    "gas": 200000,
+                    "maxFeePerGas": max_fee,
+                    "maxPriorityFeePerGas": max_priority_fee,
+                    "nonce": nonce,
+                }
+            )
             send_transaction(burn_txn)
 
             # 2. Create new metadata JSON and pin to Pinata
@@ -1709,20 +1893,24 @@ def toggle_privacy():
             media_type = post_data.get("mediaType", "photo")
             if media_type == "video":
                 token_name = "AuthenSnap Video"
-            metadata_ipfs_url = pin_metadata_to_pinata(raw_ipfs_url, token_name, media_type=media_type)
+            metadata_ipfs_url = pin_metadata_to_pinata(
+                raw_ipfs_url, token_name, media_type=media_type
+            )
 
             # 3. Mint new token
             nonce = get_nonce()
             max_fee, max_priority_fee = get_gas_params()
 
             mint_fn = contract.functions.mintToVirtual(user_id_hash, metadata_ipfs_url)
-            mint_txn = mint_fn.build_transaction({
-                "chainId": w3.eth.chain_id,
-                "gas": 500000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            })
+            mint_txn = mint_fn.build_transaction(
+                {
+                    "chainId": w3.eth.chain_id,
+                    "gas": 500000,
+                    "maxFeePerGas": max_fee,
+                    "maxPriorityFeePerGas": max_priority_fee,
+                    "nonce": nonce,
+                }
+            )
             tx_hash, receipt = send_transaction(mint_txn)
             new_token_id = extract_virtual_mint_token_id(receipt, contract)
 
@@ -1734,20 +1922,24 @@ def toggle_privacy():
                 if raw_hq_url:
                     returned_hq_url = encrypt_url(raw_hq_url)
 
-            results.append({
-                "oldTokenId": old_token_id,
-                "newTokenId": new_token_id,
-                "ipfsUri": returned_ipfs_url,
-                "hqMediaUrl": returned_hq_url,
-                "metadataUri": metadata_ipfs_url,
-                "mediaType": media_type,
-            })
+            results.append(
+                {
+                    "oldTokenId": old_token_id,
+                    "newTokenId": new_token_id,
+                    "ipfsUri": returned_ipfs_url,
+                    "hqMediaUrl": returned_hq_url,
+                    "metadataUri": metadata_ipfs_url,
+                    "mediaType": media_type,
+                }
+            )
 
-        return jsonify({
-            "success": True,
-            "isPrivate": is_private,
-            "results": results,
-        })
+        return jsonify(
+            {
+                "success": True,
+                "isPrivate": is_private,
+                "results": results,
+            }
+        )
     except Exception as e:
         print(f"Toggle privacy error: {e}")
         return jsonify({"error": f"Error toggling privacy: {e}"}), 500
@@ -1792,7 +1984,19 @@ def stitch_videos():
 
         # Run FFmpeg concat
         result = subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", output_path],
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                list_path,
+                "-c",
+                "copy",
+                output_path,
+            ],
             capture_output=True,
             text=True,
             timeout=300,
@@ -1808,6 +2012,7 @@ def stitch_videos():
             # Return stitched video as file download
             from flask import send_file
             import io
+
             return send_file(
                 io.BytesIO(stitched_bytes),
                 mimetype="video/mp4",
@@ -1817,7 +2022,9 @@ def stitch_videos():
 
         # Compress stitched video: 720p for IPFS, 1080p for Firebase Storage
         try:
-            lq_bytes = compress_video(stitched_bytes, target_height=720, max_fps=30, strip_metadata=True)
+            lq_bytes = compress_video(
+                stitched_bytes, target_height=720, max_fps=30, strip_metadata=True
+            )
             hq_bytes = compress_video(stitched_bytes, target_height=1080, max_fps=60)
         except Exception as e:
             print(f"Stitch compression failed, using original: {e}")
@@ -1839,21 +2046,27 @@ def stitch_videos():
         max_fee, max_priority_fee = get_gas_params()
 
         mint_fn = contract.functions.mintToVirtual(user_id_hash, metadata_ipfs_url)
-        txn = mint_fn.build_transaction({
-            "chainId": w3.eth.chain_id,
-            "gas": 500000,
-            "maxFeePerGas": max_fee,
-            "maxPriorityFeePerGas": max_priority_fee,
-            "nonce": nonce,
-        })
+        txn = mint_fn.build_transaction(
+            {
+                "chainId": w3.eth.chain_id,
+                "gas": 500000,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "nonce": nonce,
+            }
+        )
 
         tx_hash, receipt = send_transaction(txn)
         token_id = extract_virtual_mint_token_id(receipt, contract)
 
         # Upload 1080p HQ version to Firebase Storage
-        hq_media_url = upload_to_firebase_storage(hq_bytes, f"{token_id}.mp4", "video/mp4")
+        hq_media_url = upload_to_firebase_storage(
+            hq_bytes, f"{token_id}.mp4", "video/mp4"
+        )
         if hq_media_url:
-            print(f"HQ stitched video (1080p) uploaded to Firebase Storage: {hq_media_url}")
+            print(
+                f"HQ stitched video (1080p) uploaded to Firebase Storage: {hq_media_url}"
+            )
 
         response_data = {
             "transaction_hash": tx_hash.hex(),
@@ -1899,13 +2112,20 @@ def explore_feed():
 
     try:
         posts_ref = firestore_db.collection("posts")
-        q = posts_ref.where("flagged", "==", False).where("isPrivate", "==", False).order_by("rankScore", direction="DESCENDING").limit(limit + 1)
+        q = (
+            posts_ref.where("flagged", "==", False)
+            .where("isPrivate", "==", False)
+            .order_by("rankScore", direction="DESCENDING")
+            .limit(limit + 1)
+        )
 
         # Apply cursor-based pagination
         if cursor:
             try:
                 cursor_token_id = base64.b64decode(cursor).decode("utf-8")
-                cursor_doc = firestore_db.collection("posts").document(cursor_token_id).get()
+                cursor_doc = (
+                    firestore_db.collection("posts").document(cursor_token_id).get()
+                )
                 if cursor_doc.exists:
                     q = q.start_after(cursor_doc)
             except Exception as e:
@@ -1920,6 +2140,7 @@ def explore_feed():
 
         # Lazy refresh: recompute scores and batch-write if changed
         import time
+
         now = time.time()
         batch = firestore_db.batch()
         batch_count = 0
@@ -1964,7 +2185,9 @@ def explore_feed():
         next_cursor = None
         if has_next and docs:
             last_token_id = str(docs[-1].to_dict().get("tokenId", docs[-1].id))
-            next_cursor = base64.b64encode(last_token_id.encode("utf-8")).decode("utf-8")
+            next_cursor = base64.b64encode(last_token_id.encode("utf-8")).decode(
+                "utf-8"
+            )
 
         return jsonify({"posts": posts_result, "nextCursor": next_cursor})
 
@@ -2068,9 +2291,11 @@ def refresh_scores():
         return jsonify({"postsUpdated": updated_count})
 
     except Exception as e:
+
         print(f"Refresh scores error: {e}")
         return jsonify({"error": f"Error refreshing scores: {e}"}), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8765)
+    port = int(os.environ.get("PORT", 8765))
+    app.run(host="0.0.0.0", port=port)

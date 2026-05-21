@@ -14,6 +14,6 @@ COPY AuthenSnap.json .
 COPY Token.json .
 COPY Glas.json .
 
-EXPOSE 8765
+EXPOSE 8080
 
 CMD ["python", "server.py"]
