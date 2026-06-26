@@ -2545,11 +2545,12 @@ def verify_payment():
         if session.payment_status != "paid":
             return jsonify({"error": "Payment not completed"}), 400
 
-        # 3. Read metadata
-        meta = dict(session.metadata) if session.metadata else {}
-        user_id = meta.get("userId")
-        tokens_str = meta.get("tokens", "0")
-        tokens = int(tokens_str)
+        # 3. Read metadata (use bracket access for stripe SDK compatibility)
+        try:
+            user_id = session["metadata"]["userId"]
+            tokens = int(session["metadata"]["tokens"])
+        except (KeyError, TypeError, ValueError):
+            return jsonify({"error": "Invalid session metadata"}), 400
 
         if not user_id or not tokens:
             return jsonify({"error": "Invalid session metadata"}), 400
