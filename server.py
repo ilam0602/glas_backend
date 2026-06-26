@@ -16,6 +16,7 @@ from PIL import Image as PILImage
 import firebase_admin
 from firebase_admin import credentials, storage, firestore as fb_firestore
 from cryptography.fernet import Fernet
+from google.cloud import storage as gcs_storage
 
 # Load environment variables from .env file
 load_dotenv()
@@ -34,7 +35,7 @@ PINATA_SECRET_API_KEY = os.getenv("PINATA_SECRET_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# Firebase Admin SDK for Storage uploads
+# Firebase Admin SDK for Firestore (follower lookups, etc.)
 FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
 FIREBASE_STORAGE_BUCKET = os.getenv(
     "FIREBASE_STORAGE_BUCKET", "authensnapmobiletest.firebasestorage.app"
@@ -52,11 +53,23 @@ if FIREBASE_SERVICE_ACCOUNT_JSON:
     print(f"Firebase Admin SDK initialized with bucket: {FIREBASE_STORAGE_BUCKET}")
 else:
     print(
-        "WARNING: FIREBASE_SERVICE_ACCOUNT_JSON not set in .env. HQ media upload disabled."
+        "WARNING: FIREBASE_SERVICE_ACCOUNT_JSON not set in .env."
     )
 
 # Firestore client for reading follower relationships (unlock-post)
 firestore_db = fb_firestore.client() if firebase_app else None
+
+# Google Cloud Storage client for HQ media uploads
+# On Cloud Run, authenticates automatically via the service account
+GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "glas-hidef")
+try:
+    gcs_client = gcs_storage.Client()
+    gcs_bucket = gcs_client.bucket(GCS_BUCKET_NAME)
+    print(f"GCS client initialized with bucket: {GCS_BUCKET_NAME}")
+except Exception as e:
+    gcs_client = None
+    gcs_bucket = None
+    print(f"WARNING: GCS client init failed: {e}. HQ media upload disabled.")
 
 # Encryption key for private post URLs
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
@@ -568,21 +581,24 @@ def compress_video(file_bytes, target_height, max_fps=30, strip_metadata=False):
 
 def upload_to_firebase_storage(file_bytes, filename, content_type):
     """
-    Upload file bytes to Firebase Storage under hq_media/.
-    Returns the public download URL, or None if Firebase is not configured.
+    Upload file bytes to GCS under hq_media/ (private bucket).
+    Returns a server media URL that redirects to a signed GCS URL.
     """
-    if not firebase_app:
-        print("Firebase not configured, skipping HQ upload")
+    if not gcs_bucket:
+        print("GCS not configured, skipping HQ upload")
         return None
 
     try:
-        bucket = storage.bucket()
-        blob = bucket.blob(f"hq_media/{filename}")
+        blob_path = f"hq_media/{filename}"
+        blob = gcs_bucket.blob(blob_path)
         blob.upload_from_string(file_bytes, content_type=content_type)
-        blob.make_public()
-        return blob.public_url
+        # Return server URL that will generate signed URL redirects
+        server_url = os.getenv("SERVER_URL", "https://glas-backend-486202920754.us-central1.run.app")
+        media_url = f"{server_url}/media/{blob_path}"
+        print(f"GCS upload success: {blob_path} -> {media_url}")
+        return media_url
     except Exception as e:
-        print(f"Firebase Storage upload failed: {e}")
+        print(f"GCS upload failed: {e}")
         return None
 
 
@@ -1052,6 +1068,33 @@ def mint_nft():
         response_data["wallet_address"] = Web3.to_checksum_address(wallet_address)
 
     return jsonify(response_data)
+
+
+@app.route("/media/<path:blob_path>", methods=["GET"])
+def serve_media(blob_path):
+    """
+    Streams a file from a private GCS bucket to the client.
+    Used by the mobile app to load HQ media without public bucket access.
+    """
+    from flask import Response
+
+    if not gcs_bucket:
+        return jsonify({"error": "Storage not configured"}), 500
+
+    blob = gcs_bucket.blob(blob_path)
+    if not blob.exists():
+        return jsonify({"error": "File not found"}), 404
+
+    content = blob.download_as_bytes()
+    content_type = blob.content_type or "application/octet-stream"
+
+    return Response(
+        content,
+        content_type=content_type,
+        headers={
+            "Cache-Control": "public, max-age=86400",
+        },
+    )
 
 
 @app.route("/unlock-post", methods=["POST"])

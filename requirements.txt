@@ -49,4 +49,5 @@ yarl==1.18.3
 openai>=1.0.0
 Pillow>=10.0.0
 firebase-admin>=6.0.0
+google-cloud-storage>=2.0.0
 cryptography>=41.0.0
