@@ -2546,8 +2546,9 @@ def verify_payment():
             return jsonify({"error": "Payment not completed"}), 400
 
         # 3. Read metadata
-        user_id = session.metadata.get("userId") if session.metadata else None
-        tokens_str = session.metadata.get("tokens", "0") if session.metadata else "0"
+        meta = dict(session.metadata) if session.metadata else {}
+        user_id = meta.get("userId")
+        tokens_str = meta.get("tokens", "0")
         tokens = int(tokens_str)
 
         if not user_id or not tokens:
