@@ -2606,8 +2606,10 @@ def verify_payment():
 
         return jsonify({"success": True, "tokens": tokens})
     except Exception as e:
-        print(f"Verify payment error: {e}")
-        return jsonify({"error": "Failed to verify payment"}), 500
+        import traceback
+        traceback.print_exc()
+        print(f"Verify payment error: {e}", flush=True)
+        return jsonify({"error": f"Failed to verify payment: {e}"}), 500
 
 
 if __name__ == "__main__":
