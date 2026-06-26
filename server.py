@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from web3 import Web3
 from web3.datastructures import AttributeDict
 import os
@@ -9,12 +10,16 @@ import subprocess
 import tempfile
 import shutil
 import requests
+import stripe
 from dotenv import load_dotenv
 from hexbytes import HexBytes
 from openai import OpenAI
 from PIL import Image as PILImage
 import firebase_admin
 from firebase_admin import credentials, storage, firestore as fb_firestore
+from firebase_admin import auth as firebase_auth
+from google.cloud.firestore_v1.transforms import Increment as FirestoreIncrement
+from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 from cryptography.fernet import Fernet
 from google.cloud import storage as gcs_storage
 
@@ -30,6 +35,9 @@ GLAS_CONTRACT_ADDRESS = os.getenv("GLAS_CONTRACT_ADDRESS")
 # Pinata API keys (ensure these are present in your .env)
 PINATA_API_KEY = os.getenv("PINATA_API_KEY")
 PINATA_SECRET_API_KEY = os.getenv("PINATA_SECRET_API_KEY")
+
+# Stripe for token purchases
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 # OpenAI for content moderation
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -98,6 +106,19 @@ def decrypt_url(encrypted: str) -> str:
     return fernet.decrypt(encrypted.encode()).decode()
 
 
+def verify_firebase_token(req):
+    """Extract and verify Firebase ID token from Authorization header."""
+    auth_header = req.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header.split("Bearer ")[1]
+    try:
+        decoded = firebase_auth.verify_id_token(token)
+        return decoded["uid"]
+    except Exception:
+        return None
+
+
 if not (
     RPC_URL
     and PRIVATE_KEY
@@ -155,6 +176,12 @@ if GLAS_CONTRACT_ADDRESS:
 account = w3.eth.account.from_key(PRIVATE_KEY)
 
 app = Flask(__name__)
+CORS(app, origins=[
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "https://glassocial.com",
+    "https://www.glassocial.com",
+])
 
 # ============================================================
 # GLAS Withdrawal Constants
@@ -2402,6 +2429,184 @@ def refresh_scores():
 
         print(f"Refresh scores error: {e}")
         return jsonify({"error": f"Error refreshing scores: {e}"}), 500
+
+
+# ============================================================
+# Stripe Token Purchase Endpoints
+# ============================================================
+
+
+@app.route("/create-checkout-session", methods=["POST"])
+def create_checkout_session():
+    """
+    POST endpoint to create a Stripe Checkout Session for token purchases.
+    Requires Firebase ID token in Authorization header.
+    Body: { tokens, successUrl, cancelUrl }
+    """
+    if not stripe.api_key:
+        return jsonify({"error": "Stripe not configured"}), 500
+
+    # 1. Verify Firebase ID token
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+
+    data = request.get_json()
+    if not data or "tokens" not in data:
+        return jsonify({"error": "Missing tokens in request body"}), 400
+
+    tokens = data["tokens"]
+    success_url = data.get("successUrl")
+    cancel_url = data.get("cancelUrl")
+
+    if not success_url or not cancel_url:
+        return jsonify({"error": "Missing successUrl or cancelUrl"}), 400
+
+    # 2. Validate token amount (1,000–1,000,000, multiples of 1,000)
+    if (
+        not isinstance(tokens, int)
+        or tokens < 1000
+        or tokens > 1000000
+        or tokens % 1000 != 0
+    ):
+        return jsonify(
+            {"error": "Invalid token amount. Must be between 1,000 and 1,000,000, in multiples of 1,000."}
+        ), 400
+
+    # 3. Calculate price: tokens / 1000 * 100 cents
+    amount_cents = (tokens // 1000) * 100
+
+    # 4. Create Stripe Checkout Session
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            line_items=[
+                {
+                    "price_data": {
+                        "currency": "usd",
+                        "product_data": {
+                            "name": f"{tokens:,} Glas Tokens",
+                        },
+                        "unit_amount": amount_cents,
+                    },
+                    "quantity": 1,
+                }
+            ],
+            metadata={
+                "userId": uid,
+                "tokens": str(tokens),
+            },
+            success_url=success_url,
+            cancel_url=cancel_url,
+        )
+
+        return jsonify({"url": session.url})
+    except Exception as e:
+        print(f"Stripe checkout error: {e}")
+        return jsonify({"error": "Failed to create checkout session"}), 500
+
+
+@app.route("/verify-payment", methods=["POST"])
+def verify_payment():
+    """
+    POST endpoint to verify a Stripe payment and credit tokens.
+    Body: { sessionId }
+    """
+    if not stripe.api_key:
+        return jsonify({"error": "Stripe not configured"}), 500
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    data = request.get_json()
+    if not data or "sessionId" not in data:
+        return jsonify({"error": "Missing sessionId"}), 400
+
+    session_id = data["sessionId"]
+    if not isinstance(session_id, str) or not session_id:
+        return jsonify({"error": "Invalid sessionId"}), 400
+
+    try:
+        # 1. Idempotency check
+        completed_ref = firestore_db.collection("completedPurchases").document(session_id)
+        completed_doc = completed_ref.get()
+
+        if completed_doc.exists:
+            doc_data = completed_doc.to_dict()
+            return jsonify({
+                "success": True,
+                "tokens": doc_data.get("tokens", 0),
+                "alreadyProcessed": True,
+            })
+
+        # 2. Retrieve Stripe session
+        session = stripe.checkout.Session.retrieve(session_id)
+
+        if session.payment_status != "paid":
+            return jsonify({"error": "Payment not completed"}), 400
+
+        # 3. Read metadata
+        user_id = session.metadata.get("userId") if session.metadata else None
+        tokens_str = session.metadata.get("tokens", "0") if session.metadata else "0"
+        tokens = int(tokens_str)
+
+        if not user_id or not tokens:
+            return jsonify({"error": "Invalid session metadata"}), 400
+
+        # 4. Atomic Firestore batch write
+        batch = firestore_db.batch()
+
+        balance_ref = firestore_db.collection("tokenBalances").document(user_id)
+        batch.set(
+            balance_ref,
+            {"balance": FirestoreIncrement(tokens)},
+            merge=True,
+        )
+
+        batch.set(completed_ref, {
+            "userId": user_id,
+            "tokens": tokens,
+            "processedAt": SERVER_TIMESTAMP,
+            "stripeSessionId": session_id,
+        })
+
+        batch.commit()
+
+        # 5. On-chain sync (non-fatal)
+        try:
+            if token_contract:
+                user_id_hash = compute_user_id_hash(user_id)
+                amount_wei = w3.to_wei(tokens, "ether")
+                nonce = get_nonce()
+                max_fee, max_priority_fee = get_gas_params()
+
+                txn = token_contract.functions.mintToVirtual(
+                    user_id_hash, amount_wei
+                ).build_transaction(
+                    {
+                        "chainId": w3.eth.chain_id,
+                        "gas": 200000,
+                        "maxFeePerGas": max_fee,
+                        "maxPriorityFeePerGas": max_priority_fee,
+                        "nonce": nonce,
+                    }
+                )
+                send_transaction(txn)
+
+                # Update last on-chain balance
+                balance_ref.set(
+                    {"lastOnChainBalance": FirestoreIncrement(tokens)},
+                    merge=True,
+                )
+                print(f"On-chain sync succeeded for user {user_id}: {tokens} tokens")
+            else:
+                print("Token contract not configured, skipping on-chain sync")
+        except Exception as sync_err:
+            print(f"On-chain sync failed (non-fatal): {sync_err}")
+
+        return jsonify({"success": True, "tokens": tokens})
+    except Exception as e:
+        print(f"Verify payment error: {e}")
+        return jsonify({"error": "Failed to verify payment"}), 500
 
 
 if __name__ == "__main__":
