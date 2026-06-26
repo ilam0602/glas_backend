@@ -74,6 +74,7 @@ fernet = Fernet(
 )
 
 
+
 def encrypt_url(url: str) -> str:
     """Encrypt a URL string using Fernet symmetric encryption."""
     return fernet.encrypt(url.encode()).decode()
@@ -990,6 +991,33 @@ def mint_nft():
     if hq_media_url:
         print(f"HQ media (1080p) uploaded to Firebase Storage: {hq_media_url}")
 
+    # Generate and upload video thumbnail
+    thumbnail_url = None
+    if media_type == "video":
+        try:
+            thumb_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+            thumb_tmp.write(raw_bytes)
+            thumb_tmp.close()
+            thumb_result = subprocess.run(
+                [
+                    "ffmpeg", "-i", thumb_tmp.name,
+                    "-ss", "0", "-frames:v", "1",
+                    "-vf", "scale=-1:480",
+                    "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
+                ],
+                capture_output=True,
+                timeout=15,
+            )
+            os.unlink(thumb_tmp.name)
+            if thumb_result.returncode == 0 and thumb_result.stdout:
+                thumbnail_url = upload_to_firebase_storage(
+                    thumb_result.stdout, f"{token_id}_thumb.jpg", "image/jpeg"
+                )
+                if thumbnail_url:
+                    print(f"Video thumbnail uploaded: {thumbnail_url}")
+        except Exception as e:
+            print(f"Video thumbnail generation failed (non-blocking): {e}")
+
     # For private posts, encrypt URLs before returning to client
     returned_ipfs_uri = image_ipfs_url
     returned_hq_url = hq_media_url
@@ -1015,6 +1043,8 @@ def mint_nft():
 
     if returned_hq_url:
         response_data["hqMediaUrl"] = returned_hq_url
+    if thumbnail_url:
+        response_data["thumbnailUrl"] = thumbnail_url
 
     if user_id:
         response_data["user_id"] = user_id
@@ -1681,6 +1711,7 @@ def withdraw_tokens():
         return jsonify({"error": f"Error withdrawing tokens: {e}"}), 500
 
 
+
 def extract_virtual_burn_token_id(receipt, contract):
     """
     Extract the tokenId from the VirtualBurn event in the transaction receipt.
@@ -1952,12 +1983,18 @@ def stitch_videos():
       - videos[]: multiple video files
       - userId: Firebase user ID
       - mint: "true" or "false" (optional, default "true")
+      - text_overlay: optional text to burn into the video (static, full duration)
+      - text_font_size: optional font size for overlay (default 48)
+      - text_color: optional color for overlay (default "white")
 
     Stitches videos with FFmpeg concat, optionally mints the result as an NFT.
     """
     uploaded_files = request.files.getlist("videos[]")
     user_id = request.form.get("userId")
     should_mint = request.form.get("mint", "true").lower() == "true"
+    text_overlay = request.form.get("text_overlay", "").strip()
+    text_font_size = request.form.get("text_font_size", "48")
+    text_color = request.form.get("text_color", "white")
 
     if not uploaded_files or len(uploaded_files) < 2:
         return jsonify({"error": "At least 2 video files are required"}), 400
@@ -2004,6 +2041,34 @@ def stitch_videos():
         if result.returncode != 0:
             print(f"FFmpeg stderr: {result.stderr}")
             return jsonify({"error": f"FFmpeg failed: {result.stderr[-500:]}"}), 500
+
+        # Apply text overlay if provided
+        if text_overlay:
+            overlay_input = output_path
+            output_path = os.path.join(tmp_dir, "output_text.mp4")
+            escaped_text = text_overlay.replace("'", "\\'").replace(":", "\\:")
+            drawtext_filter = (
+                f"drawtext=text='{escaped_text}'"
+                f":fontsize={text_font_size}"
+                f":fontcolor={text_color}"
+                f":x=(w-text_w)/2:y=(h-text_h)/2"
+                f":borderw=2:bordercolor=black@0.6"
+            )
+            text_result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-i", overlay_input,
+                    "-vf", drawtext_filter,
+                    "-codec:a", "copy",
+                    output_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if text_result.returncode != 0:
+                print(f"FFmpeg text overlay stderr: {text_result.stderr}")
+                return jsonify({"error": f"Text overlay failed: {text_result.stderr[-500:]}"}), 500
 
         with open(output_path, "rb") as of:
             stitched_bytes = of.read()
