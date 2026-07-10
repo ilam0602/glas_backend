@@ -1125,12 +1125,31 @@ def serve_media(blob_path):
     if not blob.exists():
         return jsonify({"error": "File not found"}), 404
 
-    # Try signed URL redirect (works on Cloud Run with attached SA)
+    # Try signed URL redirect.
+    # On Cloud Run (no key file), use the IAM signBlob API explicitly.
+    # With a key file (GCS_SERVICE_ACCOUNT_JSON), sign locally.
     try:
-        signed_url = blob.generate_signed_url(
-            expiration=timedelta(hours=1),
-            method="GET",
-        )
+        import google.auth
+        from google.auth.transport import requests as google_auth_requests
+
+        credentials = gcs_client._credentials
+        if not hasattr(credentials, 'sign_bytes'):
+            # Compute/metadata credentials — use IAM signBlob API
+            auth_request = google_auth_requests.Request()
+            credentials.refresh(auth_request)
+            signed_url = blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(hours=1),
+                method="GET",
+                service_account_email=credentials.service_account_email,
+                access_token=credentials.token,
+            )
+        else:
+            # Key file credentials — sign locally
+            signed_url = blob.generate_signed_url(
+                expiration=timedelta(hours=1),
+                method="GET",
+            )
         return redirect(signed_url)
     except Exception as e:
         print(f"Signed URL failed, falling back to proxy: {e}")
