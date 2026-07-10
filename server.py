@@ -587,6 +587,8 @@ def compress_video(file_bytes, target_height, max_fps=30, strip_metadata=False):
             "aac",
             "-b:a",
             "128k",
+            "-movflags",
+            "+faststart",
         ]
         if strip_metadata:
             cmd += ["-map_metadata", "-1"]
@@ -610,7 +612,7 @@ def compress_video(file_bytes, target_height, max_fps=30, strip_metadata=False):
 def upload_to_firebase_storage(file_bytes, filename, content_type):
     """
     Upload file bytes to GCS under hq_media/ (private bucket).
-    Returns a server media URL that redirects to a signed GCS URL.
+    Returns a relative media path (e.g. /media/hq_media/18.mp4).
     """
     if not gcs_bucket:
         print("GCS not configured, skipping HQ upload")
@@ -620,11 +622,10 @@ def upload_to_firebase_storage(file_bytes, filename, content_type):
         blob_path = f"hq_media/{filename}"
         blob = gcs_bucket.blob(blob_path)
         blob.upload_from_string(file_bytes, content_type=content_type)
-        # Return server URL that will generate signed URL redirects
-        server_url = os.getenv("SERVER_URL", "https://glas-backend-486202920754.us-central1.run.app")
-        media_url = f"{server_url}/media/{blob_path}"
-        print(f"GCS upload success: {blob_path} -> {media_url}")
-        return media_url
+        # Return a relative path — the client prepends its own SERVER_URL
+        media_path = f"/media/{blob_path}"
+        print(f"GCS upload success: {blob_path} -> {media_path}")
+        return media_path
     except Exception as e:
         print(f"GCS upload failed: {e}")
         return None
@@ -1098,61 +1099,29 @@ def mint_nft():
     return jsonify(response_data)
 
 
-@app.route("/media/<path:blob_path>", methods=["GET"])
+@app.route("/media/<path:blob_path>", methods=["GET", "HEAD"])
 def serve_media(blob_path):
     """
-    Serves media from GCS with Range request support.
-    iOS AVPlayer requires Range requests (206 Partial Content) for video playback.
+    Redirects to a GCS signed URL (1 hour expiry).
+    GCS natively handles Range requests, streaming, and caching —
+    no need to proxy bytes through Flask.
     """
-    from flask import Response
+    from flask import redirect
+    from datetime import timedelta
 
     if not gcs_bucket:
         return jsonify({"error": "Storage not configured"}), 500
 
     blob = gcs_bucket.blob(blob_path)
-    blob.reload()  # fetch metadata (size, content_type)
 
     if not blob.exists():
         return jsonify({"error": "File not found"}), 404
 
-    file_size = blob.size
-    content_type = blob.content_type or "application/octet-stream"
-
-    range_header = request.headers.get("Range")
-
-    if range_header:
-        # Parse Range: bytes=start-end
-        range_match = range_header.replace("bytes=", "").split("-")
-        start = int(range_match[0])
-        end = int(range_match[1]) if range_match[1] else file_size - 1
-        end = min(end, file_size - 1)
-        length = end - start + 1
-
-        content = blob.download_as_bytes(start=start, end=end + 1)
-
-        return Response(
-            content,
-            status=206,
-            content_type=content_type,
-            headers={
-                "Content-Range": f"bytes {start}-{end}/{file_size}",
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(length),
-                "Cache-Control": "public, max-age=86400",
-            },
-        )
-    else:
-        content = blob.download_as_bytes()
-
-        return Response(
-            content,
-            content_type=content_type,
-            headers={
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(file_size),
-                "Cache-Control": "public, max-age=86400",
-            },
-        )
+    signed_url = blob.generate_signed_url(
+        expiration=timedelta(hours=1),
+        method="GET",
+    )
+    return redirect(signed_url)
 
 
 @app.route("/unlock-post", methods=["POST"])
@@ -2646,4 +2615,4 @@ def verify_payment():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8765))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
