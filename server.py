@@ -1132,8 +1132,8 @@ def serve_media(blob_path):
             method="GET",
         )
         return redirect(signed_url)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Signed URL failed, falling back to proxy: {e}")
 
     # Fallback: proxy the bytes (local dev with user credentials)
     blob.reload()
