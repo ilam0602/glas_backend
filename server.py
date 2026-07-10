@@ -1101,10 +1101,11 @@ def mint_nft():
 @app.route("/media/<path:blob_path>", methods=["GET"])
 def serve_media(blob_path):
     """
-    Streams a file from a private GCS bucket to the client.
-    Used by the mobile app to load HQ media without public bucket access.
+    Generates a short-lived signed GCS URL and redirects the client to it.
+    GCS natively supports Range requests, which iOS AVPlayer requires for video playback.
     """
-    from flask import Response
+    from flask import redirect
+    from datetime import timedelta
 
     if not gcs_bucket:
         return jsonify({"error": "Storage not configured"}), 500
@@ -1113,16 +1114,13 @@ def serve_media(blob_path):
     if not blob.exists():
         return jsonify({"error": "File not found"}), 404
 
-    content = blob.download_as_bytes()
-    content_type = blob.content_type or "application/octet-stream"
-
-    return Response(
-        content,
-        content_type=content_type,
-        headers={
-            "Cache-Control": "public, max-age=86400",
-        },
+    signed_url = blob.generate_signed_url(
+        version="v4",
+        expiration=timedelta(hours=1),
+        method="GET",
     )
+
+    return redirect(signed_url)
 
 
 @app.route("/unlock-post", methods=["POST"])
