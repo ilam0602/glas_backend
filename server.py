@@ -1101,26 +1101,58 @@ def mint_nft():
 @app.route("/media/<path:blob_path>", methods=["GET"])
 def serve_media(blob_path):
     """
-    Generates a short-lived signed GCS URL and redirects the client to it.
-    GCS natively supports Range requests, which iOS AVPlayer requires for video playback.
+    Serves media from GCS with Range request support.
+    iOS AVPlayer requires Range requests (206 Partial Content) for video playback.
     """
-    from flask import redirect
-    from datetime import timedelta
+    from flask import Response
 
     if not gcs_bucket:
         return jsonify({"error": "Storage not configured"}), 500
 
     blob = gcs_bucket.blob(blob_path)
+    blob.reload()  # fetch metadata (size, content_type)
+
     if not blob.exists():
         return jsonify({"error": "File not found"}), 404
 
-    signed_url = blob.generate_signed_url(
-        version="v4",
-        expiration=timedelta(hours=1),
-        method="GET",
-    )
+    file_size = blob.size
+    content_type = blob.content_type or "application/octet-stream"
 
-    return redirect(signed_url)
+    range_header = request.headers.get("Range")
+
+    if range_header:
+        # Parse Range: bytes=start-end
+        range_match = range_header.replace("bytes=", "").split("-")
+        start = int(range_match[0])
+        end = int(range_match[1]) if range_match[1] else file_size - 1
+        end = min(end, file_size - 1)
+        length = end - start + 1
+
+        content = blob.download_as_bytes(start=start, end=end + 1)
+
+        return Response(
+            content,
+            status=206,
+            content_type=content_type,
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(length),
+                "Cache-Control": "public, max-age=86400",
+            },
+        )
+    else:
+        content = blob.download_as_bytes()
+
+        return Response(
+            content,
+            content_type=content_type,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(file_size),
+                "Cache-Control": "public, max-age=86400",
+            },
+        )
 
 
 @app.route("/unlock-post", methods=["POST"])
