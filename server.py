@@ -68,10 +68,19 @@ else:
 firestore_db = fb_firestore.client() if firebase_app else None
 
 # Google Cloud Storage client for HQ media uploads
-# On Cloud Run, authenticates automatically via the service account
+# Locally: set GCS_SERVICE_ACCOUNT_JSON in .env with the backend-gcs key.
+# Cloud Run: leave unset — the attached service account is used automatically.
+GCS_SERVICE_ACCOUNT_JSON = os.getenv("GCS_SERVICE_ACCOUNT_JSON")
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "glas-hidef")
 try:
-    gcs_client = gcs_storage.Client()
+    if GCS_SERVICE_ACCOUNT_JSON:
+        from google.oauth2 import service_account as sa_auth
+        gcs_credentials = sa_auth.Credentials.from_service_account_info(
+            json.loads(GCS_SERVICE_ACCOUNT_JSON)
+        )
+        gcs_client = gcs_storage.Client(credentials=gcs_credentials, project=gcs_credentials.project_id)
+    else:
+        gcs_client = gcs_storage.Client()
     gcs_bucket = gcs_client.bucket(GCS_BUCKET_NAME)
     print(f"GCS client initialized with bucket: {GCS_BUCKET_NAME}")
 except Exception as e:
