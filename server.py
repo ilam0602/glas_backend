@@ -1125,28 +1125,32 @@ def serve_media(blob_path):
     if not blob.exists():
         return jsonify({"error": "File not found"}), 404
 
-    # Try signed URL redirect.
-    # On Cloud Run (no key file), use the IAM signBlob API explicitly.
-    # With a key file (GCS_SERVICE_ACCOUNT_JSON), sign locally.
+    # Generate a signed URL and redirect.
+    # On Cloud Run (no key file), the SA impersonates itself to access
+    # the IAM signBlob API. Locally with a key file, signs directly.
+    # Ref: https://bluerider.software/presigning-gcs-urls-for-cloud-run-app-with-an-attached-service-account/
     try:
         import google.auth
-        from google.auth.transport import requests as google_auth_requests
+        from google.auth import impersonated_credentials as imp_creds
 
         credentials = gcs_client._credentials
         if not hasattr(credentials, 'sign_bytes'):
-            # Compute/metadata credentials — use IAM signBlob API
-            auth_request = google_auth_requests.Request()
-            credentials.refresh(auth_request)
+            # Compute/metadata credentials — self-impersonate to get signing
+            signing_credentials = imp_creds.Credentials(
+                source_credentials=credentials,
+                target_principal=credentials.service_account_email,
+                target_scopes=["https://www.googleapis.com/auth/devstorage.read_only"],
+            )
             signed_url = blob.generate_signed_url(
                 version="v4",
                 expiration=timedelta(hours=1),
                 method="GET",
-                service_account_email=credentials.service_account_email,
-                access_token=credentials.token,
+                credentials=signing_credentials,
             )
         else:
             # Key file credentials — sign locally
             signed_url = blob.generate_signed_url(
+                version="v4",
                 expiration=timedelta(hours=1),
                 method="GET",
             )
