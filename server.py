@@ -1111,11 +1111,10 @@ def mint_nft():
 @app.route("/media/<path:blob_path>", methods=["GET", "HEAD"])
 def serve_media(blob_path):
     """
-    Redirects to a GCS signed URL (1 hour expiry).
-    GCS natively handles Range requests, streaming, and caching —
-    no need to proxy bytes through Flask.
+    Serves media from GCS. Tries signed URL redirect first (Cloud Run),
+    falls back to proxying bytes (local dev where signing isn't available).
     """
-    from flask import redirect
+    from flask import Response, redirect
     from datetime import timedelta
 
     if not gcs_bucket:
@@ -1126,11 +1125,64 @@ def serve_media(blob_path):
     if not blob.exists():
         return jsonify({"error": "File not found"}), 404
 
-    signed_url = blob.generate_signed_url(
-        expiration=timedelta(hours=1),
-        method="GET",
-    )
-    return redirect(signed_url)
+    # Try signed URL redirect (works on Cloud Run with attached SA)
+    try:
+        signed_url = blob.generate_signed_url(
+            expiration=timedelta(hours=1),
+            method="GET",
+        )
+        return redirect(signed_url)
+    except Exception:
+        pass
+
+    # Fallback: proxy the bytes (local dev with user credentials)
+    blob.reload()
+    file_size = blob.size
+    content_type = blob.content_type or "application/octet-stream"
+    range_header = request.headers.get("Range")
+
+    if request.method == "HEAD":
+        return Response(
+            b"",
+            status=200,
+            content_type=content_type,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(file_size),
+            },
+        )
+
+    if range_header:
+        range_match = range_header.replace("bytes=", "").split("-")
+        start = int(range_match[0])
+        end = int(range_match[1]) if range_match[1] else file_size - 1
+        end = min(end, file_size - 1)
+        length = end - start + 1
+
+        content = blob.download_as_bytes(start=start, end=end + 1)
+
+        return Response(
+            content,
+            status=206,
+            content_type=content_type,
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(length),
+                "Cache-Control": "public, max-age=86400",
+            },
+        )
+    else:
+        content = blob.download_as_bytes()
+        return Response(
+            content,
+            content_type=content_type,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(file_size),
+                "Cache-Control": "public, max-age=86400",
+            },
+        )
 
 
 @app.route("/unlock-post", methods=["POST"])
