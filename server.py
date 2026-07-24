@@ -9,6 +9,8 @@ import base64
 import subprocess
 import tempfile
 import shutil
+import uuid
+from datetime import datetime, timezone
 import requests
 import stripe
 from dotenv import load_dotenv
@@ -42,6 +44,9 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 # OpenAI for content moderation
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# Shared secret for the Cloud Scheduler -> /cleanup-expired-stories call
+CLEANUP_SECRET = os.getenv("CLEANUP_SECRET")
 
 # Firebase Admin SDK for Firestore (follower lookups, etc.)
 FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
@@ -1292,6 +1297,106 @@ def unlock_post():
     except Exception as e:
         print(f"Unlock post error: {e}")
         return jsonify({"error": f"Error unlocking post: {e}"}), 500
+
+
+@app.route("/story-upload", methods=["POST"])
+def story_upload():
+    """
+    POST endpoint to upload ephemeral story media to GCS.
+    Body: { image: <base64>, userId, mediaType: "photo"|"video" }
+    No IPFS pin, no NFT mint -- stories are not minted.
+    Returns { storyId, mediaPath, mediaType, flagged, flagReason }.
+    """
+    data = request.get_json()
+    if not data or "image" not in data or "userId" not in data:
+        return jsonify({"error": "Missing image or userId in request body"}), 400
+
+    base64_media = data["image"]
+    user_id = data["userId"]
+    media_type = data.get("mediaType", "photo")
+
+    raw_bytes = base64.b64decode(base64_media)
+    story_id = str(uuid.uuid4())
+
+    try:
+        if media_type == "video":
+            hq_bytes = compress_video(raw_bytes, target_height=1080, max_fps=60)
+            ext, content_type = "mp4", "video/mp4"
+        else:
+            hq_base64 = compress_image(base64_media, target_height=1080)
+            hq_bytes = base64.b64decode(hq_base64)
+            ext, content_type = "jpg", "image/jpeg"
+    except Exception as e:
+        print(f"Story compression failed, using original: {e}")
+        hq_bytes = raw_bytes
+        ext, content_type = ("mp4", "video/mp4") if media_type == "video" else ("jpg", "image/jpeg")
+
+    if media_type == "video":
+        analysis = analyze_video(raw_bytes)
+    else:
+        analysis = analyze_image(base64_media)
+
+    if not gcs_bucket:
+        return jsonify({"error": "Storage not configured"}), 500
+
+    try:
+        blob_path = f"stories/{user_id}/{story_id}.{ext}"
+        blob = gcs_bucket.blob(blob_path)
+        blob.upload_from_string(hq_bytes, content_type=content_type)
+        media_path = f"/media/{blob_path}"
+    except Exception as e:
+        print(f"Story GCS upload failed: {e}")
+        return jsonify({"error": f"Error uploading story: {e}"}), 500
+
+    return jsonify({
+        "storyId": story_id,
+        "mediaPath": media_path,
+        "mediaType": media_type,
+        "flagged": analysis.get("flagged", False),
+        "flagReason": analysis.get("reason", ""),
+    })
+
+
+@app.route("/cleanup-expired-stories", methods=["POST"])
+def cleanup_expired_stories():
+    """
+    Deletes stories whose expiresAt has passed: removes the GCS blob,
+    the Firestore doc, and its views subcollection.
+    Called by Cloud Scheduler every 15-30 min. Auth via shared secret header.
+    """
+    if not CLEANUP_SECRET or request.headers.get("X-Cleanup-Secret") != CLEANUP_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    now = datetime.now(timezone.utc)
+    expired_query = firestore_db.collection("stories").where("expiresAt", "<=", now)
+    expired_docs = list(expired_query.stream())
+
+    deleted_count = 0
+    errors = []
+    for story_doc in expired_docs:
+        story_data = story_doc.to_dict()
+        media_path = story_data.get("mediaPath", "")
+        blob_path = media_path.replace("/media/", "", 1)
+
+        try:
+            if gcs_bucket and blob_path:
+                blob = gcs_bucket.blob(blob_path)
+                if blob.exists():
+                    blob.delete()
+
+            views = story_doc.reference.collection("views").stream()
+            for view_doc in views:
+                view_doc.reference.delete()
+
+            story_doc.reference.delete()
+            deleted_count += 1
+        except Exception as e:
+            errors.append({"storyId": story_doc.id, "error": str(e)})
+
+    return jsonify({"deletedCount": deleted_count, "errors": errors})
 
 
 @app.route("/export", methods=["POST"])
