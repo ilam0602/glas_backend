@@ -7,6 +7,7 @@ import io
 import json
 import base64
 import subprocess
+import secrets
 import tempfile
 import shutil
 import uuid
@@ -22,6 +23,7 @@ from firebase_admin import credentials, storage, firestore as fb_firestore
 from firebase_admin import auth as firebase_auth
 from google.cloud.firestore_v1.transforms import Increment as FirestoreIncrement
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
+from google.api_core.exceptions import AlreadyExists
 from cryptography.fernet import Fernet
 from google.cloud import storage as gcs_storage
 
@@ -273,6 +275,163 @@ def record_withdrawal(
         )
     except Exception as e:
         print(f"Error recording withdrawal: {e}")
+
+
+# Alphabet excludes visually ambiguous characters (0/O, 1/I/L).
+REFERRAL_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+REFERRAL_CODE_LENGTH = 7
+REFERRAL_CODE_MAX_ATTEMPTS = 10
+
+
+def generate_referral_code() -> str:
+    """Generate a random 7-char referral code from the collision-safe alphabet."""
+    return "".join(
+        secrets.choice(REFERRAL_CODE_ALPHABET) for _ in range(REFERRAL_CODE_LENGTH)
+    )
+
+
+def assign_referral_code(user_id: str) -> str:
+    """
+    Generate and atomically reserve a unique referral code for user_id,
+    then persist it onto their own user doc (users/{uid}.referralCode) so
+    the mobile client can read it back. Uses Firestore's create() (fails
+    if the doc already exists) as the uniqueness gate instead of a full
+    transaction, retrying on collision. Raises RuntimeError if no free
+    code is found within the attempt budget.
+    """
+    for _ in range(REFERRAL_CODE_MAX_ATTEMPTS):
+        code = generate_referral_code()
+        code_ref = firestore_db.collection("referralCodes").document(code)
+        try:
+            code_ref.create({"userId": user_id})
+            firestore_db.collection("users").document(user_id).set(
+                {"referralCode": code}, merge=True
+            )
+            return code
+        except AlreadyExists:
+            continue
+    raise RuntimeError(
+        f"Could not generate a unique referral code after {REFERRAL_CODE_MAX_ATTEMPTS} attempts"
+    )
+
+
+def ensure_referral_code(user_id: str, user_data=None):
+    """
+    Return an existing referral code for user_id or assign one if missing.
+    Also repairs the referralCodes reverse lookup when possible. Returns
+    (code, created), where created is True only when a new code was assigned.
+    """
+    if user_data is None:
+        user_doc = firestore_db.collection("users").document(user_id).get()
+        user_data = user_doc.to_dict() if user_doc.exists else {}
+
+    existing_code = user_data.get("referralCode")
+    if existing_code:
+        code_ref = firestore_db.collection("referralCodes").document(existing_code)
+        try:
+            code_ref.create({"userId": user_id})
+        except AlreadyExists:
+            code_doc = code_ref.get()
+            code_owner = code_doc.to_dict().get("userId") if code_doc.exists else None
+            if code_owner and code_owner != user_id:
+                new_code = assign_referral_code(user_id)
+                return new_code, True
+        return existing_code, False
+
+    return assign_referral_code(user_id), True
+
+
+def redeem_referral_code(code: str, new_user_id: str):
+    """
+    Look up a referral code and link the new account to its owner.
+    Returns the referrer's userId on success, or None if the code is
+    missing/unknown/self-referential — signup must never fail because of
+    an invalid code, so callers should treat None as a silent no-op.
+    """
+    if not code:
+        return None
+
+    code_doc = firestore_db.collection("referralCodes").document(code).get()
+    if not code_doc.exists:
+        return None
+
+    referrer_id = code_doc.to_dict().get("userId")
+    if not referrer_id or referrer_id == new_user_id:
+        return None
+
+    # Both writes must land together — a batch (not two independent .set()
+    # calls) so a partial failure can't link referredBy without crediting
+    # the referrer, or vice versa.
+    batch = firestore_db.batch()
+    batch.set(
+        firestore_db.collection("users").document(new_user_id),
+        {"referredBy": referrer_id},
+        merge=True,
+    )
+    batch.set(
+        firestore_db.collection("users").document(referrer_id),
+        {"points": FirestoreIncrement(1)},
+        merge=True,
+    )
+    batch.commit()
+    return referrer_id
+
+
+LONG_VIDEO_THRESHOLD_SECONDS = 30
+
+
+def credit_post_points(user_id: str, media_type: str, duration_seconds):
+    """
+    Credit the poster: +1 for a photo, +2 for a video >= 30s, +0 for a
+    shorter video. Returns the number of points credited (0, 1, or 2) so
+    the caller knows whether a referral bonus should also apply.
+    """
+    if media_type == "video":
+        points = (
+            2
+            if duration_seconds is not None
+            and duration_seconds >= LONG_VIDEO_THRESHOLD_SECONDS
+            else 0
+        )
+    else:
+        points = 1
+
+    if points > 0:
+        firestore_db.collection("users").document(user_id).set(
+            {"points": FirestoreIncrement(points)}, merge=True
+        )
+    return points
+
+
+def credit_referral_bonus(poster_id: str, points_type: str):
+    """
+    If poster_id was referred by someone, credit that referrer +1
+    (picture) or +2 (video), at most once per UTC calendar day per
+    (referrer, referee) pair. points_type must be 'picture' or 'video'.
+    """
+    poster_doc = firestore_db.collection("users").document(poster_id).get()
+    if not poster_doc.exists:
+        return
+
+    referrer_id = poster_doc.to_dict().get("referredBy")
+    if not referrer_id:
+        return
+
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    dedup_ref = firestore_db.collection("referralCredits").document(
+        f"{referrer_id}_{poster_id}_{today}"
+    )
+    try:
+        dedup_ref.create(
+            {"type": points_type, "creditedAt": datetime.now(timezone.utc)}
+        )
+    except AlreadyExists:
+        return  # Already credited today for this referral pair.
+
+    bonus = 2 if points_type == "video" else 1
+    firestore_db.collection("users").document(referrer_id).set(
+        {"points": FirestoreIncrement(bonus)}, merge=True
+    )
 
 
 def compute_user_id_hash(user_id: str) -> bytes:
@@ -645,6 +804,45 @@ def upload_to_firebase_storage(file_bytes, filename, content_type):
         return None
 
 
+def get_video_duration_seconds(video_bytes):
+    """
+    Return the video's duration in seconds via ffprobe, or None if the
+    duration can't be determined (corrupt/unsupported file, ffprobe
+    missing, temp file creation failure, etc). Callers must treat None as
+    "not long enough to qualify for the 30s+ bonus" rather than raising —
+    this function must never raise past its own boundary.
+    """
+    tmp = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        tmp.write(video_bytes)
+        tmp.close()
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                tmp.name,
+            ],
+            capture_output=True,
+            timeout=15,
+            text=True,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            print(f"ffprobe duration check failed: {result.stderr}")
+            return None
+        return float(result.stdout.strip())
+    except Exception as e:
+        print(f"ffprobe duration check failed: {e}")
+        return None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+
 def pin_file_to_pinata(base64_image_str, media_type="photo"):
     """
     Takes a base64-encoded file string, uploads it to Pinata, and returns an ipfs:// URI.
@@ -930,9 +1128,22 @@ def mint_nft():
             400,
         )
 
+    # Only the virtual-wallet (userId) path has a real Firebase account to
+    # verify against — the legacy walletAddress-only path predates Firebase
+    # auth entirely and is intentionally left ungated.
+    if user_id:
+        uid = verify_firebase_token(request)
+        if not uid or uid != user_id:
+            return jsonify({"error": "Missing or invalid authorization token"}), 401
+
     # 1. Compress media for IPFS (720p) and Firebase Storage (1080p)
     hq_media_url = None
     raw_bytes = base64.b64decode(base64_image)
+
+    duration_seconds = None
+    if media_type == "video":
+        duration_seconds = get_video_duration_seconds(raw_bytes)
+
     try:
         if media_type == "video":
             # 720p version for IPFS/NFT metadata (strip metadata for privacy)
@@ -1037,6 +1248,17 @@ def mint_nft():
             )
         return jsonify({"error": f"Error sending transaction: {e}"}), 500
 
+    # Points crediting is additive and must never fail an otherwise-successful mint.
+    if user_id and firestore_db:
+        try:
+            points_earned = credit_post_points(user_id, media_type, duration_seconds)
+            if points_earned > 0:
+                credit_referral_bonus(
+                    user_id, "video" if media_type == "video" else "picture"
+                )
+        except Exception as e:
+            print(f"Points crediting failed (non-blocking): {e}")
+
     # Upload 1080p HQ version to Firebase Storage (now that we have tokenId)
     if media_type == "video":
         ext = "mp4"
@@ -1139,11 +1361,15 @@ def serve_media(blob_path):
         from google.auth import impersonated_credentials as imp_creds
 
         credentials = gcs_client._credentials
-        if not hasattr(credentials, 'sign_bytes'):
+        if not hasattr(credentials, "sign_bytes"):
             # Compute/metadata credentials — self-impersonate to get signing
+            target_principal = getattr(credentials, "service_account_email", None)
+            if not target_principal:
+                raise RuntimeError("Current GCS credentials cannot sign URLs locally")
+
             signing_credentials = imp_creds.Credentials(
                 source_credentials=credentials,
-                target_principal=credentials.service_account_email,
+                target_principal=target_principal,
                 target_scopes=["https://www.googleapis.com/auth/devstorage.read_only"],
             )
             signed_url = blob.generate_signed_url(
@@ -1181,13 +1407,22 @@ def serve_media(blob_path):
         )
 
     if range_header:
-        range_match = range_header.replace("bytes=", "").split("-")
-        start = int(range_match[0])
-        end = int(range_match[1]) if range_match[1] else file_size - 1
+        range_match = range_header.replace("bytes=", "").split("-", 1)
+        start = int(range_match[0] or 0)
+        end = int(range_match[1]) if len(range_match) > 1 and range_match[1] else file_size - 1
         end = min(end, file_size - 1)
+        if start > end or start >= file_size:
+            return Response(
+                b"",
+                status=416,
+                headers={
+                    "Content-Range": f"bytes */{file_size}",
+                    "Accept-Ranges": "bytes",
+                },
+            )
         length = end - start + 1
 
-        content = blob.download_as_bytes(start=start, end=end + 1)
+        content = blob.download_as_bytes(start=start, end=end)
 
         return Response(
             content,
@@ -1563,17 +1798,50 @@ def import_token():
 def create_account():
     """
     POST endpoint to create a new user account with initial token balance.
-    Body: { userId }
-    Mints 10,000 tokens to the user's virtual wallet.
+    Body: { userId, referralCode? }
+    Mints 10,000 tokens to the user's virtual wallet, assigns the new
+    account its own referral code, and (if a valid referralCode was
+    passed) links referredBy and credits the referrer +1 point.
     """
-    if not token_contract:
-        return jsonify({"error": "Token contract not configured"}), 500
-
     data = request.get_json()
     if not data or "userId" not in data:
         return jsonify({"error": "Missing userId"}), 400
 
     user_id = data["userId"]
+    submitted_referral_code = data.get("referralCode")
+
+    uid = verify_firebase_token(request)
+    if not uid or uid != user_id:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+
+    response_data = {
+        "success": True,
+        "userId": user_id,
+    }
+
+    # Referral setup is additive and runs before token minting so a chain/RPC
+    # failure cannot leave an otherwise-created Firebase user without a code.
+    # It is idempotent: /create-account can be retried by the client and must
+    # not generate a second referral code or double-credit a referrer.
+    if firestore_db:
+        try:
+            user_doc = firestore_db.collection("users").document(user_id).get()
+            user_data = user_doc.to_dict() if user_doc.exists else {}
+
+            own_code, _ = ensure_referral_code(user_id, user_data)
+            response_data["referralCode"] = own_code
+
+            if "referredBy" in user_data:
+                response_data["referralLinked"] = True
+            else:
+                referrer_id = redeem_referral_code(submitted_referral_code, user_id)
+                response_data["referralLinked"] = referrer_id is not None
+        except Exception as e:
+            print(f"Referral setup failed (non-blocking): {e}")
+
+    if not token_contract:
+        return jsonify({"error": "Token contract not configured"}), 500
+
     user_id_hash = compute_user_id_hash(user_id)
     amount = w3.to_wei(10000, "ether")  # 10,000 tokens
 
@@ -1595,17 +1863,148 @@ def create_account():
 
         tx_hash, receipt = send_transaction(txn)
 
-        return jsonify(
-            {
-                "success": True,
-                "userId": user_id,
-                "tokensGranted": 10000,
-                "transaction_hash": tx_hash.hex(),
-            }
-        )
+        response_data["tokensGranted"] = 10000
+        response_data["transaction_hash"] = tx_hash.hex()
+
+        return jsonify(response_data)
     except Exception as e:
         print(f"Create account error: {e}")
         return jsonify({"error": f"Error creating account: {e}"}), 500
+
+
+@app.route("/referral/leaderboard", methods=["GET"])
+def referral_leaderboard():
+    """
+    GET endpoint for the all-time referral points leaderboard.
+    Query params: limit (default 50, capped at 100)
+    Returns { leaderboard: [{ userId, displayName, points, rank }] }
+    """
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    limit = min(request.args.get("limit", 50, type=int), 100)
+
+    try:
+        query = (
+            firestore_db.collection("users")
+            .order_by("points", direction="DESCENDING")
+            .limit(limit)
+        )
+        leaderboard = []
+        for rank, doc in enumerate(query.stream(), start=1):
+            data = doc.to_dict()
+            leaderboard.append(
+                {
+                    "userId": doc.id,
+                    "displayName": data.get("displayName") or f"user_{doc.id[:6]}",
+                    "points": data.get("points", 0),
+                    "rank": rank,
+                }
+            )
+        return jsonify({"leaderboard": leaderboard})
+    except Exception as e:
+        print(f"Leaderboard error: {e}")
+        return jsonify({"error": f"Error fetching leaderboard: {e}"}), 500
+
+
+@app.route("/referral/code", methods=["POST"])
+def ensure_current_user_referral_code():
+    """
+    Authenticated repair endpoint for the current user's referral code.
+    Used by the mobile profile sheet so a missing legacy code can be fixed
+    on demand without exposing the admin backfill endpoint to the client.
+    """
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    try:
+        user_doc = firestore_db.collection("users").document(uid).get()
+        user_data = user_doc.to_dict() if user_doc.exists else {}
+        code, created = ensure_referral_code(uid, user_data)
+
+        if "points" not in user_data:
+            firestore_db.collection("users").document(uid).set(
+                {"points": 0}, merge=True
+            )
+
+        return jsonify(
+            {
+                "success": True,
+                "referralCode": code,
+                "points": user_data.get("points", 0),
+                "created": created,
+            }
+        )
+    except Exception as e:
+        print(f"Ensure referral code error: {e}")
+        return jsonify({"error": f"Error ensuring referral code: {e}"}), 500
+
+
+@app.route("/backfill-referral-codes", methods=["POST"])
+def backfill_referral_codes():
+    """
+    Maintenance endpoint to assign referral codes to existing users that
+    predate the referral system or missed setup after a non-blocking signup
+    failure. Auth uses the same shared secret header as story cleanup.
+    Body: { dryRun?: bool, limit?: number }
+    """
+    if not CLEANUP_SECRET or request.headers.get("X-Cleanup-Secret") != CLEANUP_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    data = request.get_json(silent=True) or {}
+    dry_run = bool(data.get("dryRun", False))
+    limit = data.get("limit")
+    if limit is not None:
+        try:
+            limit = max(1, min(int(limit), 1000))
+        except (TypeError, ValueError):
+            return jsonify({"error": "limit must be a number"}), 400
+
+    users_query = firestore_db.collection("users")
+    if limit:
+        users_query = users_query.limit(limit)
+
+    scanned_count = 0
+    assigned_count = 0
+    missing_count = 0
+    errors = []
+
+    for user_doc in users_query.stream():
+        scanned_count += 1
+        user_data = user_doc.to_dict() or {}
+        if not user_data.get("referralCode"):
+            missing_count += 1
+
+        if dry_run:
+            continue
+
+        try:
+            _code, created = ensure_referral_code(user_doc.id, user_data)
+            if created:
+                assigned_count += 1
+            if "points" not in user_data:
+                user_doc.reference.set({"points": 0}, merge=True)
+        except Exception as e:
+            errors.append({"userId": user_doc.id, "error": str(e)})
+
+    return jsonify(
+        {
+            "success": True,
+            "dryRun": dry_run,
+            "scannedCount": scanned_count,
+            "missingCount": missing_count,
+            "assignedCount": assigned_count,
+            "errorCount": len(errors),
+            "errors": errors,
+        }
+    )
 
 
 @app.route("/token-balance/<user_id>", methods=["GET"])
