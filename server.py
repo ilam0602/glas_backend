@@ -2065,7 +2065,7 @@ def referral_leaderboard():
     """
     GET endpoint for the all-time referral points leaderboard.
     Query params: limit (default 50, capped at 100)
-    Returns { leaderboard: [{ userId, displayName, points, rank }] }
+    Returns { leaderboard: [{ userId, email, displayName, points, rank }] }
     """
     if not firestore_db:
         return jsonify({"error": "Firebase not configured on server"}), 500
@@ -2081,10 +2081,22 @@ def referral_leaderboard():
         leaderboard = []
         for rank, doc in enumerate(query.stream(), start=1):
             data = doc.to_dict()
+            email = data.get("email") or ""
+            if not email:
+                post_query = (
+                    firestore_db.collection("posts")
+                    .where("userId", "==", doc.id)
+                    .limit(1)
+                )
+                for post_doc in post_query.stream():
+                    email = post_doc.to_dict().get("userEmail") or ""
+                    break
+            display_name = email or data.get("displayName") or f"user_{doc.id[:6]}"
             leaderboard.append(
                 {
                     "userId": doc.id,
-                    "displayName": data.get("displayName") or f"user_{doc.id[:6]}",
+                    "email": email,
+                    "displayName": display_name,
                     "points": data.get("points", 0),
                     "rank": rank,
                 }
