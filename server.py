@@ -1634,6 +1634,194 @@ def cleanup_expired_stories():
     return jsonify({"deletedCount": deleted_count, "errors": errors})
 
 
+@app.route("/studio-items", methods=["GET"])
+def list_studio_items():
+    """
+    List the current user's private studio gallery items.
+    Requires Firebase ID token in Authorization header.
+    """
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    try:
+        docs = (
+            firestore_db.collection("users")
+            .document(uid)
+            .collection("studioItems")
+            .order_by("createdAt", direction="DESCENDING")
+            .stream()
+        )
+        items = []
+        for item_doc in docs:
+            data = item_doc.to_dict() or {}
+            items.append(
+                {
+                    "id": item_doc.id,
+                    "type": data.get("type", "video"),
+                    "filename": data.get("filename", ""),
+                    "mediaPath": data.get("mediaPath", ""),
+                    "thumbnailPath": data.get("thumbnailPath", ""),
+                    "durationMs": data.get("durationMs", 0),
+                    "createdAt": data.get("createdAtMs", 0),
+                    "source": data.get("source", "recorded"),
+                    "parentIds": data.get("parentIds"),
+                    "fileSizeBytes": data.get("fileSizeBytes", 0),
+                }
+            )
+        return jsonify({"items": items})
+    except Exception as e:
+        print(f"Studio list failed: {e}")
+        return jsonify({"error": f"Error listing studio items: {e}"}), 500
+
+
+@app.route("/studio-upload", methods=["POST"])
+def studio_upload():
+    """
+    Upload a private studio gallery item to GCS and save metadata to Firestore.
+    Requires Firebase ID token in Authorization header.
+    """
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+
+    if not gcs_bucket:
+        return jsonify({"error": "Storage not configured"}), 500
+
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    is_multipart = bool(request.files)
+    data = request.form if is_multipart else request.get_json()
+    media_file = request.files.get("media") if is_multipart else None
+
+    if not data:
+        return jsonify({"error": "Missing request body"}), 400
+    if is_multipart and not media_file:
+        return jsonify({"error": "Missing media file"}), 400
+    if not is_multipart and "media" not in data:
+        return jsonify({"error": "Missing media in request body"}), 400
+
+    media_type = data.get("mediaType", "video")
+    if media_type not in ["photo", "video"]:
+        return jsonify({"error": "mediaType must be photo or video"}), 400
+
+    item_id = str(uuid.uuid4())
+    ext, content_type = ("mp4", "video/mp4") if media_type == "video" else ("jpg", "image/jpeg")
+    filename = f"{item_id}.{ext}"
+    blob_path = f"studio/{uid}/{filename}"
+
+    try:
+        media_bytes = media_file.read() if media_file else base64.b64decode(data["media"])
+        media_blob = gcs_bucket.blob(blob_path)
+        media_blob.upload_from_string(media_bytes, content_type=content_type)
+        media_path = f"/media/{blob_path}"
+
+        thumbnail_path = ""
+        thumbnail_file = request.files.get("thumbnail") if is_multipart else None
+        thumbnail_base64 = data.get("thumbnail") if not is_multipart else None
+        if thumbnail_file or thumbnail_base64:
+            thumbnail_bytes = thumbnail_file.read() if thumbnail_file else base64.b64decode(thumbnail_base64)
+            thumbnail_blob_path = f"studio/{uid}/thumbnails/{item_id}.jpg"
+            thumbnail_blob = gcs_bucket.blob(thumbnail_blob_path)
+            thumbnail_blob.upload_from_string(thumbnail_bytes, content_type="image/jpeg")
+            thumbnail_path = f"/media/{thumbnail_blob_path}"
+        elif media_type == "photo":
+            thumbnail_path = media_path
+
+        now = datetime.now(timezone.utc)
+        now_ms = int(now.timestamp() * 1000)
+        parent_ids = data.get("parentIds")
+        if isinstance(parent_ids, str):
+            try:
+                parent_ids = json.loads(parent_ids)
+            except Exception:
+                parent_ids = None
+        item = {
+            "type": media_type,
+            "filename": filename,
+            "mediaPath": media_path,
+            "thumbnailPath": thumbnail_path,
+            "durationMs": int(data.get("durationMs") or 0),
+            "createdAt": now,
+            "createdAtMs": now_ms,
+            "source": data.get("source", "recorded"),
+            "parentIds": parent_ids,
+            "fileSizeBytes": int(data.get("fileSizeBytes") or len(media_bytes)),
+        }
+        (
+            firestore_db.collection("users")
+            .document(uid)
+            .collection("studioItems")
+            .document(item_id)
+            .set(item)
+        )
+
+        return jsonify(
+            {
+                "id": item_id,
+                "type": item["type"],
+                "filename": item["filename"],
+                "mediaPath": item["mediaPath"],
+                "thumbnailPath": item["thumbnailPath"],
+                "durationMs": item["durationMs"],
+                "createdAt": item["createdAtMs"],
+                "source": item["source"],
+                "parentIds": item["parentIds"],
+                "fileSizeBytes": item["fileSizeBytes"],
+            }
+        )
+    except Exception as e:
+        print(f"Studio upload failed: {e}")
+        return jsonify({"error": f"Error uploading studio item: {e}"}), 500
+
+
+@app.route("/studio-items/<item_id>", methods=["DELETE"])
+def delete_studio_item(item_id):
+    """
+    Delete a private studio gallery item and its GCS blobs.
+    Requires Firebase ID token in Authorization header.
+    """
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    item_ref = (
+        firestore_db.collection("users")
+        .document(uid)
+        .collection("studioItems")
+        .document(item_id)
+    )
+    item_doc = item_ref.get()
+    if not item_doc.exists:
+        return jsonify({"success": True})
+
+    data = item_doc.to_dict() or {}
+    paths = {
+        path
+        for path in [data.get("mediaPath"), data.get("thumbnailPath")]
+        if path
+    }
+    for media_path in paths:
+        blob_path = media_path.replace("/media/", "", 1)
+        try:
+            if gcs_bucket and blob_path:
+                blob = gcs_bucket.blob(blob_path)
+                if blob.exists():
+                    blob.delete()
+        except Exception as e:
+            print(f"Studio blob delete failed for {blob_path}: {e}")
+
+    item_ref.delete()
+    return jsonify({"success": True})
+
+
 @app.route("/export", methods=["POST"])
 def export_token():
     """
