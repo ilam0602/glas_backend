@@ -11,6 +11,7 @@ import secrets
 import tempfile
 import shutil
 import uuid
+import threading
 from datetime import datetime, timezone
 import requests
 import stripe
@@ -23,7 +24,7 @@ from firebase_admin import credentials, storage, firestore as fb_firestore
 from firebase_admin import auth as firebase_auth
 from google.cloud.firestore_v1.transforms import Increment as FirestoreIncrement
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
-from google.api_core.exceptions import AlreadyExists
+from google.api_core.exceptions import AlreadyExists, NotFound
 from cryptography.fernet import Fernet
 from google.cloud import storage as gcs_storage
 
@@ -843,6 +844,81 @@ def get_video_duration_seconds(video_bytes):
                 pass
 
 
+def process_mint_media_item(base64_data, media_type):
+    """
+    Compress one media item (720p for IPFS, 1080p for GCS HQ), pin the 720p
+    version to Pinata, and run AI moderation on it. Returns a dict consumed
+    by /mint. Raises if the Pinata upload fails; compression failures fall
+    back to the original bytes (same behavior as the old single-media path).
+    """
+    raw_bytes = base64.b64decode(base64_data)
+
+    duration_seconds = None
+    if media_type == "video":
+        duration_seconds = get_video_duration_seconds(raw_bytes)
+
+    try:
+        if media_type == "video":
+            # 720p version for IPFS/NFT metadata (strip metadata for privacy)
+            lq_bytes = compress_video(
+                raw_bytes, target_height=720, max_fps=30, strip_metadata=True
+            )
+            lq_base64 = base64.b64encode(lq_bytes).decode("utf-8")
+            # 1080p version for Firebase Storage (HQ in-app display, keep metadata)
+            hq_bytes = compress_video(raw_bytes, target_height=1080, max_fps=60)
+        else:
+            lq_base64 = compress_image(base64_data, target_height=720)
+            hq_base64 = compress_image(base64_data, target_height=1080)
+            hq_bytes = base64.b64decode(hq_base64)
+    except Exception as e:
+        print(f"Compression failed, using original: {e}")
+        lq_base64 = base64_data
+        hq_bytes = raw_bytes
+
+    ipfs_url = pin_file_to_pinata(lq_base64, media_type=media_type)
+    print(
+        f"{'Video' if media_type == 'video' else 'Image'} (720p) uploaded to IPFS: {ipfs_url}"
+    )
+
+    if media_type == "video":
+        analysis = analyze_video(raw_bytes)
+    else:
+        analysis = analyze_image(base64_data)
+
+    return {
+        "media_type": media_type,
+        "raw_bytes": raw_bytes,
+        "hq_bytes": hq_bytes,
+        "ipfs_url": ipfs_url,
+        "analysis": analysis,
+        "duration_seconds": duration_seconds,
+    }
+
+
+def generate_video_thumbnail_bytes(video_bytes):
+    """Extract a 480p JPEG poster frame from a video. Returns bytes or None."""
+    try:
+        thumb_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        thumb_tmp.write(video_bytes)
+        thumb_tmp.close()
+        thumb_result = subprocess.run(
+            [
+                "ffmpeg", "-i", thumb_tmp.name,
+                "-ss", "0", "-frames:v", "1",
+                "-vf", "scale=-1:480",
+                "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
+            ],
+            capture_output=True,
+            timeout=15,
+        )
+        os.unlink(thumb_tmp.name)
+        if thumb_result.returncode == 0 and thumb_result.stdout:
+            return thumb_result.stdout
+    except Exception as e:
+        print(f"Video thumbnail generation failed (non-blocking): {e}")
+    return None
+
+
 def pin_file_to_pinata(base64_image_str, media_type="photo"):
     """
     Takes a base64-encoded file string, uploads it to Pinata, and returns an ipfs:// URI.
@@ -877,6 +953,7 @@ def pin_metadata_to_pinata(
     token_name,
     description="Photo minted on AuthenSnap",
     media_type="photo",
+    media_items=None,
 ):
     """
     Creates an ERC-721 metadata JSON with the image/video URL and pins it to Pinata.
@@ -888,6 +965,11 @@ def pin_metadata_to_pinata(
       "description": "...",
       "image": "ipfs://QmImageHash"
     }
+
+    media_items: optional list of (ipfs_url, media_type) tuples for carousel
+    posts. When given, the metadata also carries a "media" array listing every
+    item; "image" (and "animation_url" for a leading video) still point at the
+    first item so OpenSea previews keep working.
     """
     gateway_url = image_ipfs_url.replace(
         "ipfs://", "https://gateway.pinata.cloud/ipfs/"
@@ -901,6 +983,17 @@ def pin_metadata_to_pinata(
     if media_type == "video":
         metadata["animation_url"] = gateway_url
         metadata["media_type"] = "video"
+
+    if media_items:
+        metadata["media"] = [
+            {
+                "uri": item_ipfs.replace(
+                    "ipfs://", "https://gateway.pinata.cloud/ipfs/"
+                ),
+                "media_type": item_type,
+            }
+            for (item_ipfs, item_type) in media_items
+        ]
 
     url = "https://api.pinata.cloud/pinning/pinJSONToIPFS"
     headers = {
@@ -1007,6 +1100,38 @@ def send_transaction(txn):
     return tx_hash, receipt
 
 
+# One server account signs every transaction (regular mints, burns, background
+# story mints), so nonce management must be serialized. The lock must be held
+# through mining (not just nonce-fetch -> sign -> send): get_nonce() CANCELS any
+# pending unmined transactions it sees, so a second caller entering before the
+# first tx mines would cancel the first tx.
+tx_lock = threading.Lock()
+
+
+def send_contract_transaction(fn_call, gas_limit):
+    """
+    Thread-safe get_nonce() + build_transaction + send_transaction for a bound
+    contract function (e.g. contract.functions.mintToVirtual(hash, uri)).
+    Returns (tx_hash, receipt). Raises on failure, like send_transaction.
+    """
+    with tx_lock:
+        nonce = get_nonce()
+        max_fee, max_priority_fee = get_gas_params()
+        print(f"Building transaction with nonce: {nonce}")
+        print(f"  max_fee: {w3.from_wei(max_fee, 'gwei'):.2f} gwei")
+        print(f"  max_priority_fee: {w3.from_wei(max_priority_fee, 'gwei'):.2f} gwei")
+        txn = fn_call.build_transaction(
+            {
+                "chainId": w3.eth.chain_id,
+                "gas": gas_limit,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "nonce": nonce,
+            }
+        )
+        return send_transaction(txn)
+
+
 @app.route("/tokens/<wallet_address>", methods=["GET"])
 def get_tokens(wallet_address):
     """
@@ -1102,25 +1227,48 @@ def cancel_pending():
 @app.route("/mint", methods=["POST"])
 def mint_nft():
     """
-    POST endpoint that takes a JSON body with:
-      - image: Base64-encoded image data
-      - userId: the Firebase user ID (for virtual wallet minting)
+    POST endpoint that mints ONE NFT for one post.
+
+    Accepts EITHER the legacy single-media body:
+      { image: <base64>, userId, mediaType, isPrivate }
+    OR the carousel body (1-10 items, one token for all of them):
+      { media: [{ image: <base64>, mediaType: 'photo'|'video' }, ...],
+        userId, isPrivate }
 
     Also supports legacy format with walletAddress for backward compatibility.
-
-    1) Decodes the image and uploads it to Pinata (IPFS)
-    2) Creates ERC-721 metadata JSON and uploads to Pinata
-    3) Mints with metadata URI on-chain, returns image URI to client
+    Every item is compressed (720p IPFS / 1080p GCS HQ), pinned, and moderated;
+    the post is flagged if ANY item flags. Response keeps the legacy fields
+    (populated from item 0) and adds media_items / mediaCount.
     """
     data = request.get_json()
-    if not data or "image" not in data:
-        return jsonify({"error": "Missing image in request body"}), 400
+    if not data or ("image" not in data and "media" not in data):
+        return jsonify({"error": "Missing image or media in request body"}), 400
 
-    base64_image = data["image"]
     user_id = data.get("userId")
     wallet_address = data.get("walletAddress")
-    media_type = data.get("mediaType", "photo")
     is_private = data.get("isPrivate", False)
+
+    # Normalize both request shapes into an ordered list of {image, mediaType}.
+    is_carousel = "media" in data
+    if is_carousel:
+        media_param = data["media"]
+        if not isinstance(media_param, list) or not (1 <= len(media_param) <= 10):
+            return jsonify({"error": "media must be a list of 1-10 items"}), 400
+        items_in = []
+        for m in media_param:
+            if not isinstance(m, dict) or "image" not in m:
+                return (
+                    jsonify({"error": "Each media item needs an image field"}),
+                    400,
+                )
+            item_type = m.get("mediaType", "photo")
+            if item_type not in ("photo", "video"):
+                return jsonify({"error": f"Invalid mediaType: {item_type}"}), 400
+            items_in.append({"image": m["image"], "mediaType": item_type})
+    else:
+        items_in = [
+            {"image": data["image"], "mediaType": data.get("mediaType", "photo")}
+        ]
 
     if not user_id and not wallet_address:
         return (
@@ -1136,98 +1284,78 @@ def mint_nft():
         if not uid or uid != user_id:
             return jsonify({"error": "Missing or invalid authorization token"}), 401
 
-    # 1. Compress media for IPFS (720p) and Firebase Storage (1080p)
-    hq_media_url = None
-    raw_bytes = base64.b64decode(base64_image)
-
-    duration_seconds = None
-    if media_type == "video":
-        duration_seconds = get_video_duration_seconds(raw_bytes)
-
-    try:
-        if media_type == "video":
-            # 720p version for IPFS/NFT metadata (strip metadata for privacy)
-            lq_bytes = compress_video(
-                raw_bytes, target_height=720, max_fps=30, strip_metadata=True
+    # 1. Compress + pin to IPFS + moderate every item (order preserved)
+    processed = []
+    for index, item in enumerate(items_in):
+        try:
+            processed.append(
+                process_mint_media_item(item["image"], item["mediaType"])
             )
-            lq_base64 = base64.b64encode(lq_bytes).decode("utf-8")
-            # 1080p version for Firebase Storage (HQ in-app display, keep metadata)
-            hq_bytes = compress_video(raw_bytes, target_height=1080, max_fps=60)
-        else:
-            # 720p version for IPFS/NFT metadata
-            lq_base64 = compress_image(base64_image, target_height=720)
-            # 1080p version for Firebase Storage (HQ in-app display)
-            hq_base64 = compress_image(base64_image, target_height=1080)
-            hq_bytes = base64.b64decode(hq_base64)
-    except Exception as e:
-        print(f"Compression failed, using original: {e}")
-        lq_base64 = base64_image
-        hq_bytes = raw_bytes
+        except Exception as e:
+            print(f"Item {index} Pinata upload failed: {e}")
+            return (
+                jsonify({"error": f"Error uploading item {index} to Pinata: {e}"}),
+                500,
+            )
 
-    # 1a. Pin 720p version to IPFS
+    primary = processed[0]
+    media_type = primary["media_type"]
+
+    # 1c. Combine per-item AI analysis: flagged if ANY item flags.
+    flagged_analyses = [
+        p["analysis"] for p in processed if p["analysis"].get("flagged")
+    ]
+    all_tags = []
+    for p in processed:
+        for tag in p["analysis"].get("tags", []):
+            if tag not in all_tags:
+                all_tags.append(tag)
+    analysis = {
+        "flagged": bool(flagged_analyses),
+        "reason": flagged_analyses[0].get("reason", "") if flagged_analyses else "",
+        "tags": all_tags[:5],
+        "description": primary["analysis"].get("description", ""),
+    }
+
+    # 2. Create and pin ERC-721 metadata JSON (image = first item; carousel
+    #    requests also list every item in a "media" array)
     try:
-        image_ipfs_url = pin_file_to_pinata(lq_base64, media_type=media_type)
-        print(
-            f"{'Video' if media_type == 'video' else 'Image'} (720p) uploaded to IPFS: {image_ipfs_url}"
+        token_name = (
+            "AuthenSnap Video" if media_type == "video" else "AuthenSnap Photo"
         )
-    except Exception as e:
-        print(e)
-        return jsonify({"error": f"Error uploading to Pinata: {e}"}), 500
-
-    # 1b. Upload 1080p version to Firebase Storage
-    # (tokenId not known yet, will use a placeholder and rename after mint)
-    # We'll upload after minting when we have the tokenId
-
-    # 1c. Run AI analysis: moderation + content tagging
-    if media_type == "video":
-        analysis = analyze_video(raw_bytes)
-    else:
-        analysis = analyze_image(base64_image)
-
-    # 2. Get nonce (cancel pending if needed)
-    nonce = get_nonce()
-    max_fee, max_priority_fee = get_gas_params()
-
-    # 3. Create and pin ERC-721 metadata JSON (so OpenSea shows the content)
-    try:
-        token_name = "AuthenSnap Video" if media_type == "video" else "AuthenSnap Photo"
         metadata_ipfs_url = pin_metadata_to_pinata(
-            image_ipfs_url, token_name, media_type=media_type
+            primary["ipfs_url"],
+            token_name,
+            media_type=media_type,
+            media_items=(
+                [(p["ipfs_url"], p["media_type"]) for p in processed]
+                if is_carousel
+                else None
+            ),
         )
         print(f"Metadata uploaded to IPFS: {metadata_ipfs_url}")
     except Exception as e:
         print(e)
         return jsonify({"error": f"Error uploading metadata to Pinata: {e}"}), 500
 
-    print(f"Building transaction with nonce: {nonce}")
-    print(f"  max_fee: {w3.from_wei(max_fee, 'gwei'):.2f} gwei")
-    print(f"  max_priority_fee: {w3.from_wei(max_priority_fee, 'gwei'):.2f} gwei")
-
-    # 4. Build and send transaction (store metadata URI on-chain, not the raw image)
+    # 3. Build and send transaction through the tx lock (one mint per post) —
+    #    send_contract_transaction (Task C1) owns nonce + gas handling.
     try:
         if user_id:
             user_id_hash = compute_user_id_hash(user_id)
-            mint_fn = contract.functions.mintToVirtual(user_id_hash, metadata_ipfs_url)
+            mint_fn = contract.functions.mintToVirtual(
+                user_id_hash, metadata_ipfs_url
+            )
         else:
             recipient = Web3.to_checksum_address(wallet_address)
             mint_fn = contract.get_function_by_signature("mint(address,string)")
             mint_fn = mint_fn(recipient, metadata_ipfs_url)
-
-        txn = mint_fn.build_transaction(
-            {
-                "chainId": w3.eth.chain_id,
-                "gas": 500000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            }
-        )
     except Exception as e:
         print(e)
         return jsonify({"error": f"Error building transaction: {e}"}), 500
 
     try:
-        tx_hash, receipt = send_transaction(txn)
+        tx_hash, receipt = send_contract_transaction(mint_fn, 500000)
 
         if user_id:
             token_id = extract_virtual_mint_token_id(receipt, contract)
@@ -1248,10 +1376,14 @@ def mint_nft():
             )
         return jsonify({"error": f"Error sending transaction: {e}"}), 500
 
-    # Points crediting is additive and must never fail an otherwise-successful mint.
+    # Points crediting is additive and must never fail an otherwise-successful
+    # mint. One post = one credit, based on the first item (a carousel is one
+    # post, not N posts).
     if user_id and firestore_db:
         try:
-            points_earned = credit_post_points(user_id, media_type, duration_seconds)
+            points_earned = credit_post_points(
+                user_id, media_type, primary["duration_seconds"]
+            )
             if points_earned > 0:
                 credit_referral_bonus(
                     user_id, "video" if media_type == "video" else "picture"
@@ -1259,73 +1391,72 @@ def mint_nft():
         except Exception as e:
             print(f"Points crediting failed (non-blocking): {e}")
 
-    # Upload 1080p HQ version to Firebase Storage (now that we have tokenId)
-    if media_type == "video":
-        ext = "mp4"
-        content_type = "video/mp4"
-    else:
-        ext = "jpg"
-        content_type = "image/jpeg"
-    hq_media_url = upload_to_firebase_storage(
-        hq_bytes, f"{token_id}.{ext}", content_type
-    )
-    if hq_media_url:
-        print(f"HQ media (1080p) uploaded to Firebase Storage: {hq_media_url}")
+    # Upload 1080p HQ versions + video thumbnails (now that we have tokenId).
+    # Carousel items are indexed ({token_id}_{index}.{ext}); the legacy shape
+    # keeps {token_id}.{ext} so existing posts/URLs are unaffected.
+    media_items_out = []
+    for index, p in enumerate(processed):
+        base_name = f"{token_id}_{index}" if is_carousel else f"{token_id}"
+        if p["media_type"] == "video":
+            ext, content_type = "mp4", "video/mp4"
+        else:
+            ext, content_type = "jpg", "image/jpeg"
 
-    # Generate and upload video thumbnail
-    thumbnail_url = None
-    if media_type == "video":
-        try:
-            thumb_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-            thumb_tmp.write(raw_bytes)
-            thumb_tmp.close()
-            thumb_result = subprocess.run(
-                [
-                    "ffmpeg", "-i", thumb_tmp.name,
-                    "-ss", "0", "-frames:v", "1",
-                    "-vf", "scale=-1:480",
-                    "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
-                ],
-                capture_output=True,
-                timeout=15,
-            )
-            os.unlink(thumb_tmp.name)
-            if thumb_result.returncode == 0 and thumb_result.stdout:
-                thumbnail_url = upload_to_firebase_storage(
-                    thumb_result.stdout, f"{token_id}_thumb.jpg", "image/jpeg"
+        item_hq_url = upload_to_firebase_storage(
+            p["hq_bytes"], f"{base_name}.{ext}", content_type
+        )
+        if item_hq_url:
+            print(f"HQ media (1080p) uploaded to Firebase Storage: {item_hq_url}")
+
+        item_thumb_url = None
+        if p["media_type"] == "video":
+            thumb_bytes = generate_video_thumbnail_bytes(p["raw_bytes"])
+            if thumb_bytes:
+                item_thumb_url = upload_to_firebase_storage(
+                    thumb_bytes, f"{base_name}_thumb.jpg", "image/jpeg"
                 )
-                if thumbnail_url:
-                    print(f"Video thumbnail uploaded: {thumbnail_url}")
-        except Exception as e:
-            print(f"Video thumbnail generation failed (non-blocking): {e}")
+                if item_thumb_url:
+                    print(f"Video thumbnail uploaded: {item_thumb_url}")
 
-    # For private posts, encrypt URLs before returning to client
-    returned_ipfs_uri = image_ipfs_url
-    returned_hq_url = hq_media_url
-    if is_private:
-        returned_ipfs_uri = encrypt_url(image_ipfs_url)
-        if hq_media_url:
-            returned_hq_url = encrypt_url(hq_media_url)
+        # For private posts, encrypt URLs before returning to client
+        item_ipfs = p["ipfs_url"]
+        if is_private:
+            item_ipfs = encrypt_url(item_ipfs)
+            if item_hq_url:
+                item_hq_url = encrypt_url(item_hq_url)
 
-    # Return the file URI (not the metadata URI) so the mobile app can display it directly
+        media_items_out.append(
+            {
+                "ipfs_uri": item_ipfs,
+                "hqMediaUrl": item_hq_url,
+                "thumbnailUrl": item_thumb_url,
+                "mediaType": p["media_type"],
+            }
+        )
+
+    first = media_items_out[0]
+
+    # Legacy fields mirror item 0 so existing clients keep working unchanged.
     response_data = {
         "transaction_hash": tx_hash.hex(),
         "token_id": token_id,
-        "ipfs_uri": returned_ipfs_uri,
+        "ipfs_uri": first["ipfs_uri"],
         "metadata_uri": metadata_ipfs_url,
         "mediaType": media_type,
         "isPrivate": is_private,
-        "flagged": analysis.get("flagged", False),
-        "flag_reason": analysis.get("reason", ""),
-        "tags": analysis.get("tags", []),
-        "description": analysis.get("description", ""),
+        "flagged": analysis["flagged"],
+        "flag_reason": analysis["reason"],
+        "tags": analysis["tags"],
+        "description": analysis["description"],
+        "media_items": media_items_out,
+        "mediaCount": len(media_items_out),
         "receipt": make_json_serializable(receipt),
     }
 
-    if returned_hq_url:
-        response_data["hqMediaUrl"] = returned_hq_url
-    if thumbnail_url:
-        response_data["thumbnailUrl"] = thumbnail_url
+    if first["hqMediaUrl"]:
+        response_data["hqMediaUrl"] = first["hqMediaUrl"]
+    if first["thumbnailUrl"]:
+        response_data["thumbnailUrl"] = first["thumbnailUrl"]
 
     if user_id:
         response_data["user_id"] = user_id
@@ -1479,12 +1610,13 @@ def unlock_post():
 
         if not is_private:
             # Not private, return URLs as-is (they're not encrypted)
-            return jsonify(
-                {
-                    "ipfsUrl": post_data.get("ipfsUrl", ""),
-                    "hqMediaUrl": post_data.get("hqMediaUrl", ""),
-                }
-            )
+            response = {
+                "ipfsUrl": post_data.get("ipfsUrl", ""),
+                "hqMediaUrl": post_data.get("hqMediaUrl", ""),
+            }
+            if post_data.get("media"):
+                response["media"] = post_data["media"]
+            return jsonify(response)
 
         # Check authorization: owner or follower
         is_owner = viewer_id == owner_id
@@ -1522,16 +1654,95 @@ def unlock_post():
         except Exception:
             decrypted_hq = encrypted_hq
 
-        return jsonify(
-            {
-                "ipfsUrl": decrypted_ipfs,
-                "hqMediaUrl": decrypted_hq,
-            }
-        )
+        # Carousel posts: decrypt every item in the media array too
+        unlocked_media = []
+        for item in post_data.get("media") or []:
+            entry = dict(item)
+            for key in ("ipfsUrl", "hqMediaUrl"):
+                value = entry.get(key)
+                if value:
+                    try:
+                        entry[key] = decrypt_url(value)
+                    except Exception:
+                        pass  # old/unencrypted value — return as stored
+            unlocked_media.append(entry)
+
+        response = {
+            "ipfsUrl": decrypted_ipfs,
+            "hqMediaUrl": decrypted_hq,
+        }
+        if unlocked_media:
+            response["media"] = unlocked_media
+        return jsonify(response)
 
     except Exception as e:
         print(f"Unlock post error: {e}")
         return jsonify({"error": f"Error unlocking post: {e}"}), 500
+
+
+def mint_story_nft_background(story_id, user_id, media_b64, media_type):
+    """
+    Daemon-thread mint of a story NFT, run after /story-upload has responded.
+    Accepted failure mode: the story still works as an ephemeral story --
+    log and drop, no retry queue. The NFT (and its IPFS pin) intentionally
+    outlives the 24h story expiry; the cleanup sweep only removes GCS +
+    Firestore, and the token keeps showing in /tokens/virtual/<uid>.
+    """
+    try:
+        if not firestore_db:
+            print(f"Story mint {story_id}: Firestore not configured, skipping")
+            return
+
+        # 1. Account privacy flag (default False). The flag itself is owned by
+        #    the settings/account-privacy section -- we only consume it here.
+        is_private = False
+        try:
+            user_doc = firestore_db.collection("users").document(user_id).get()
+            if user_doc.exists:
+                is_private = bool((user_doc.to_dict() or {}).get("isPrivate", False))
+        except Exception as e:
+            print(f"Story mint {story_id}: isPrivate read failed, defaulting to public: {e}")
+
+        # 2. Pin the already-compressed media, then the metadata JSON.
+        #    pin_metadata_to_pinata sets image = gateway URL, and for video
+        #    also animation_url + media_type (server.py:876).
+        image_ipfs_url = pin_file_to_pinata(media_b64, media_type=media_type)
+        metadata_ipfs_url = pin_metadata_to_pinata(
+            image_ipfs_url,
+            "AuthenSnap Story",
+            description="Story minted on AuthenSnap",
+            media_type=media_type,
+        )
+        print(f"Story {story_id}: media {image_ipfs_url}, metadata {metadata_ipfs_url}")
+
+        # 3. Mint on-chain -- serialized with every other tx via tx_lock.
+        user_id_hash = compute_user_id_hash(user_id)
+        mint_fn = contract.functions.mintToVirtual(user_id_hash, metadata_ipfs_url)
+        tx_hash, receipt = send_contract_transaction(mint_fn, 500000)
+        token_id = extract_virtual_mint_token_id(receipt, contract)
+        print(f"Story {story_id}: minted tokenId {token_id}")
+
+        # 4. Patch the story doc; skip silently if it no longer exists
+        #    (expired/cleaned up, or the client never wrote it).
+        stored_ipfs_url = encrypt_url(image_ipfs_url) if is_private else image_ipfs_url
+        story_ref = firestore_db.collection("stories").document(story_id)
+        if not story_ref.get().exists:
+            print(f"Story {story_id}: doc already deleted, skipping patch")
+            return
+        try:
+            story_ref.update(
+                {
+                    "tokenId": token_id,
+                    "transactionHash": tx_hash.hex(),
+                    "isPrivate": is_private,
+                    "ipfsUrl": stored_ipfs_url,
+                    "mintedAt": datetime.now(timezone.utc),
+                }
+            )
+        except NotFound:
+            print(f"Story {story_id}: doc deleted mid-patch, skipping")
+    except Exception as e:
+        print(f"Story mint failed for {story_id} (story remains ephemeral): {e}")
 
 
 @app.route("/story-upload", methods=["POST"])
@@ -1582,6 +1793,19 @@ def story_upload():
     except Exception as e:
         print(f"Story GCS upload failed: {e}")
         return jsonify({"error": f"Error uploading story: {e}"}), 500
+
+    # Fire-and-forget NFT mint. The response below returns immediately; the
+    # daemon thread pins + mints + patches stories/{storyId} on its own time.
+    threading.Thread(
+        target=mint_story_nft_background,
+        args=(
+            story_id,
+            user_id,
+            base64.b64encode(hq_bytes).decode("utf-8"),
+            media_type,
+        ),
+        daemon=True,
+    ).start()
 
     return jsonify({
         "storyId": story_id,
@@ -1848,21 +2072,9 @@ def export_token():
 
     try:
         user_id_hash = compute_user_id_hash(user_id)
-        nonce = get_nonce()
-        max_fee, max_priority_fee = get_gas_params()
 
         export_fn = contract.functions.exportToken(user_id_hash, token_id, recipient)
-        txn = export_fn.build_transaction(
-            {
-                "chainId": w3.eth.chain_id,
-                "gas": 200000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            }
-        )
-
-        tx_hash, receipt = send_transaction(txn)
+        tx_hash, receipt = send_contract_transaction(export_fn, 200000)
 
         return jsonify(
             {
@@ -1900,21 +2112,9 @@ def transfer_post():
     try:
         from_hash = compute_user_id_hash(from_user_id)
         to_hash = compute_user_id_hash(to_user_id)
-        nonce = get_nonce()
-        max_fee, max_priority_fee = get_gas_params()
 
         transfer_fn = contract.functions.transferVirtual(from_hash, to_hash, token_id)
-        txn = transfer_fn.build_transaction(
-            {
-                "chainId": w3.eth.chain_id,
-                "gas": 200000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            }
-        )
-
-        tx_hash, receipt = send_transaction(txn)
+        tx_hash, receipt = send_contract_transaction(transfer_fn, 200000)
 
         return jsonify(
             {
@@ -1947,21 +2147,9 @@ def import_token():
 
     try:
         user_id_hash = compute_user_id_hash(user_id)
-        nonce = get_nonce()
-        max_fee, max_priority_fee = get_gas_params()
 
         import_fn = contract.functions.importToken(user_id_hash, token_id)
-        txn = import_fn.build_transaction(
-            {
-                "chainId": w3.eth.chain_id,
-                "gas": 200000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            }
-        )
-
-        tx_hash, receipt = send_transaction(txn)
+        tx_hash, receipt = send_contract_transaction(import_fn, 200000)
 
         return jsonify(
             {
@@ -2034,22 +2222,8 @@ def create_account():
     amount = w3.to_wei(10000, "ether")  # 10,000 tokens
 
     try:
-        nonce = get_nonce()
-        max_fee, max_priority_fee = get_gas_params()
-
-        txn = token_contract.functions.mintToVirtual(
-            user_id_hash, amount
-        ).build_transaction(
-            {
-                "chainId": w3.eth.chain_id,
-                "gas": 200000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            }
-        )
-
-        tx_hash, receipt = send_transaction(txn)
+        mint_fn = token_contract.functions.mintToVirtual(user_id_hash, amount)
+        tx_hash, receipt = send_contract_transaction(mint_fn, 200000)
 
         response_data["tokensGranted"] = 10000
         response_data["transaction_hash"] = tx_hash.hex()
@@ -2252,22 +2426,9 @@ def sync_token_balance():
     try:
         user_id_hash = compute_user_id_hash(user_id)
         amount_wei = w3.to_wei(additional_amount, "ether")
-        nonce = get_nonce()
-        max_fee, max_priority_fee = get_gas_params()
 
-        txn = token_contract.functions.mintToVirtual(
-            user_id_hash, amount_wei
-        ).build_transaction(
-            {
-                "chainId": w3.eth.chain_id,
-                "gas": 200000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            }
-        )
-
-        tx_hash, receipt = send_transaction(txn)
+        mint_fn = token_contract.functions.mintToVirtual(user_id_hash, amount_wei)
+        tx_hash, receipt = send_contract_transaction(mint_fn, 200000)
 
         return jsonify(
             {
@@ -2301,20 +2462,9 @@ def set_glas_price():
 
     try:
         price_wei = w3.to_wei(price_usd, "ether")
-        nonce = get_nonce()
-        max_fee, max_priority_fee = get_gas_params()
 
-        txn = glas_contract.functions.setPrice(price_wei).build_transaction(
-            {
-                "chainId": w3.eth.chain_id,
-                "gas": 100000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            }
-        )
-
-        tx_hash, receipt = send_transaction(txn)
+        price_fn = glas_contract.functions.setPrice(price_wei)
+        tx_hash, receipt = send_contract_transaction(price_fn, 100000)
 
         return jsonify(
             {
@@ -2482,71 +2632,31 @@ def withdraw_tokens():
             print(
                 f"Syncing {w3.from_wei(deficit_wei, 'ether')} stable tokens on-chain first."
             )
-            nonce = get_nonce()
-            max_fee, max_priority_fee = get_gas_params()
-            sync_txn = token_contract.functions.mintToVirtual(
+            sync_fn = token_contract.functions.mintToVirtual(
                 user_id_hash, deficit_wei
-            ).build_transaction(
-                {
-                    "chainId": w3.eth.chain_id,
-                    "gas": 200000,
-                    "maxFeePerGas": max_fee,
-                    "maxPriorityFeePerGas": max_priority_fee,
-                    "nonce": nonce,
-                }
             )
-            send_transaction(sync_txn)
+            send_contract_transaction(sync_fn, 200000)
 
         # 7. Burn stable tokens by exporting to burn address
-        nonce = get_nonce()
-        max_fee, max_priority_fee = get_gas_params()
-        burn_txn = token_contract.functions.exportTokens(
+        burn_fn = token_contract.functions.exportTokens(
             user_id_hash, stable_amount_wei, Web3.to_checksum_address(BURN_ADDRESS)
-        ).build_transaction(
-            {
-                "chainId": w3.eth.chain_id,
-                "gas": 200000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            }
         )
-        send_transaction(burn_txn)
+        send_contract_transaction(burn_fn, 200000)
 
         # 8. Credit GLAS from pool to user virtual wallet
         glas_amount_wei = w3.to_wei(glas_amount, "ether")
-        nonce = get_nonce()
-        max_fee, max_priority_fee = get_gas_params()
-        credit_txn = glas_contract.functions.creditFromPool(
+        credit_fn = glas_contract.functions.creditFromPool(
             user_id_hash, glas_amount_wei
-        ).build_transaction(
-            {
-                "chainId": w3.eth.chain_id,
-                "gas": 200000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            }
         )
-        send_transaction(credit_txn)
+        send_contract_transaction(credit_fn, 200000)
 
         # 9. (Optional) Export GLAS to real address
         export_tx_hash = None
         if recipient:
-            nonce = get_nonce()
-            max_fee, max_priority_fee = get_gas_params()
-            export_txn = glas_contract.functions.exportTokens(
+            export_fn = glas_contract.functions.exportTokens(
                 user_id_hash, glas_amount_wei, recipient
-            ).build_transaction(
-                {
-                    "chainId": w3.eth.chain_id,
-                    "gas": 200000,
-                    "maxFeePerGas": max_fee,
-                    "maxPriorityFeePerGas": max_priority_fee,
-                    "nonce": nonce,
-                }
             )
-            export_hash, _ = send_transaction(export_txn)
+            export_hash, _ = send_contract_transaction(export_fn, 200000)
             export_tx_hash = export_hash.hex()
 
         # 10. Record withdrawal in Firestore
@@ -2617,21 +2727,9 @@ def burn_nft():
 
     try:
         user_id_hash = compute_user_id_hash(user_id)
-        nonce = get_nonce()
-        max_fee, max_priority_fee = get_gas_params()
 
         burn_fn = contract.functions.burnVirtual(user_id_hash, token_id)
-        txn = burn_fn.build_transaction(
-            {
-                "chainId": w3.eth.chain_id,
-                "gas": 200000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            }
-        )
-
-        tx_hash, receipt = send_transaction(txn)
+        tx_hash, receipt = send_contract_transaction(burn_fn, 200000)
 
         return jsonify(
             {
@@ -2674,21 +2772,9 @@ def remint_post():
 
         # Mint new token on-chain
         user_id_hash = compute_user_id_hash(user_id)
-        nonce = get_nonce()
-        max_fee, max_priority_fee = get_gas_params()
 
         mint_fn = contract.functions.mintToVirtual(user_id_hash, metadata_ipfs_url)
-        txn = mint_fn.build_transaction(
-            {
-                "chainId": w3.eth.chain_id,
-                "gas": 500000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            }
-        )
-
-        tx_hash, receipt = send_transaction(txn)
+        tx_hash, receipt = send_contract_transaction(mint_fn, 500000)
         new_token_id = extract_virtual_mint_token_id(receipt, contract)
 
         # Encrypt URLs if private
@@ -2762,20 +2848,9 @@ def toggle_privacy():
 
             # 1. Burn old token on-chain
             user_id_hash = compute_user_id_hash(user_id)
-            nonce = get_nonce()
-            max_fee, max_priority_fee = get_gas_params()
 
             burn_fn = contract.functions.burnVirtual(user_id_hash, old_token_id)
-            burn_txn = burn_fn.build_transaction(
-                {
-                    "chainId": w3.eth.chain_id,
-                    "gas": 200000,
-                    "maxFeePerGas": max_fee,
-                    "maxPriorityFeePerGas": max_priority_fee,
-                    "nonce": nonce,
-                }
-            )
-            send_transaction(burn_txn)
+            send_contract_transaction(burn_fn, 200000)
 
             # 2. Create new metadata JSON and pin to Pinata
             token_name = "AuthenSnap Photo"
@@ -2787,20 +2862,8 @@ def toggle_privacy():
             )
 
             # 3. Mint new token
-            nonce = get_nonce()
-            max_fee, max_priority_fee = get_gas_params()
-
             mint_fn = contract.functions.mintToVirtual(user_id_hash, metadata_ipfs_url)
-            mint_txn = mint_fn.build_transaction(
-                {
-                    "chainId": w3.eth.chain_id,
-                    "gas": 500000,
-                    "maxFeePerGas": max_fee,
-                    "maxPriorityFeePerGas": max_priority_fee,
-                    "nonce": nonce,
-                }
-            )
-            tx_hash, receipt = send_transaction(mint_txn)
+            tx_hash, receipt = send_contract_transaction(mint_fn, 500000)
             new_token_id = extract_virtual_mint_token_id(receipt, contract)
 
             # 4. Encrypt URLs if switching to private
@@ -2832,6 +2895,284 @@ def toggle_privacy():
     except Exception as e:
         print(f"Toggle privacy error: {e}")
         return jsonify({"error": f"Error toggling privacy: {e}"}), 500
+
+
+def delete_doc_recursive(doc_ref):
+    """
+    Delete a Firestore document and ALL of its subcollections, depth-first.
+    (Firestore never cascades subcollection deletes; the Admin SDK's
+    doc_ref.collections() lets us enumerate them.)
+    """
+    for sub_collection in doc_ref.collections():
+        for sub_doc in sub_collection.stream():
+            delete_doc_recursive(sub_doc.reference)
+    doc_ref.delete()
+
+
+@app.route("/delete-account", methods=["POST"])
+def delete_account():
+    """
+    Full account wipe. Auth via Firebase ID token; the uid comes from the
+    token ONLY - any request body is ignored. Steps run in order, each
+    best-effort: failures are appended to errors[] and later steps still run.
+    Returns {"deleted": true, "errors": [...]}.
+    """
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    errors = []
+    user_id_hash = compute_user_id_hash(uid)
+    user_ref = firestore_db.collection("users").document(uid)
+
+    # -- Gather everything later steps need BEFORE deleting anything --
+    username = None
+    try:
+        user_doc = user_ref.get()
+        if user_doc.exists:
+            username = (user_doc.to_dict() or {}).get("username")
+    except Exception as e:
+        errors.append(f"read users/{uid}: {e}")
+
+    hq_token_ids = set()  # for hq_media/ GCS cleanup in step 3
+
+    # 1. Burn all virtual-wallet NFTs (sequential; tx_lock serializes nonces
+    #    against concurrent regular mints and background story mints).
+    token_ids = []
+    try:
+        token_ids = [
+            int(t) for t in contract.functions.getVirtualTokens(user_id_hash).call()
+        ]
+    except Exception as e:
+        errors.append(f"getVirtualTokens: {e}")
+    for token_id in token_ids:
+        hq_token_ids.add(token_id)
+        try:
+            burn_fn = contract.functions.burnVirtual(user_id_hash, token_id)
+            send_contract_transaction(burn_fn, 200000)
+        except Exception as e:
+            errors.append(f"burnVirtual {token_id}: {e}")
+
+    # 2a. Own posts, including likes/comments (and any other) subcollections.
+    own_post_ids = set()
+    try:
+        for post_doc in (
+            firestore_db.collection("posts").where("userId", "==", uid).stream()
+        ):
+            own_post_ids.add(post_doc.id)
+            try:
+                hq_token_ids.add(int(post_doc.id))  # post doc id == tokenId
+            except ValueError:
+                pass
+            try:
+                delete_doc_recursive(post_doc.reference)
+            except Exception as e:
+                errors.append(f"delete post {post_doc.id}: {e}")
+    except Exception as e:
+        errors.append(f"query own posts: {e}")
+
+    # 2b. Likes/comments this user left on OTHER posts (collection-group on
+    #     the userId field both doc types carry); decrement parent counters
+    #     best-effort, skipping posts we already deleted in 2a.
+    for group_name, count_field in (("likes", "likesCount"), ("comments", "commentsCount")):
+        try:
+            group_query = firestore_db.collection_group(group_name).where(
+                "userId", "==", uid
+            )
+            for item_doc in group_query.stream():
+                post_ref = item_doc.reference.parent.parent
+                try:
+                    item_doc.reference.delete()
+                    if post_ref is not None and post_ref.id not in own_post_ids:
+                        post_ref.update({count_field: FirestoreIncrement(-1)})
+                except Exception as e:
+                    errors.append(f"delete {group_name} {item_doc.reference.path}: {e}")
+        except Exception as e:
+            errors.append(f"collection-group {group_name}: {e}")
+
+    # 2b2. Reactions this user left on OTHER posts (collection-group on the
+    #      userId field — postService.ts:363,376,389). Parent counter is a
+    #      per-emoji MAP (posts/{id}.reactionCounts.{type} — postService.ts:54,
+    #      371,394), NOT a single number, so we DO NOT decrement it here; we
+    #      only delete the reaction doc. Reactions on the user's OWN posts are
+    #      already gone via delete_doc_recursive in 2a.
+    try:
+        reactions_query = firestore_db.collection_group("reactions").where(
+            "userId", "==", uid
+        )
+        for reaction_doc in reactions_query.stream():
+            try:
+                reaction_doc.reference.delete()
+            except Exception as e:
+                errors.append(f"delete reaction {reaction_doc.reference.path}: {e}")
+    except Exception as e:
+        errors.append(f"collection-group reactions: {e}")
+
+    # 2c. Stories: GCS blob + views subcollection + doc (same treatment as
+    #     /cleanup-expired-stories, line ~1688).
+    try:
+        for story_doc in (
+            firestore_db.collection("stories").where("userId", "==", uid).stream()
+        ):
+            story_data = story_doc.to_dict() or {}
+            blob_path = story_data.get("mediaPath", "").replace("/media/", "", 1)
+            try:
+                if gcs_bucket and blob_path:
+                    blob = gcs_bucket.blob(blob_path)
+                    if blob.exists():
+                        blob.delete()
+                delete_doc_recursive(story_doc.reference)
+            except Exception as e:
+                errors.append(f"delete story {story_doc.id}: {e}")
+    except Exception as e:
+        errors.append(f"query stories: {e}")
+
+    # 2d. Follow/block mirror docs on OTHER users. Must run before 2i wipes
+    #     our own subcollections (the doc ids ARE the other users' uids -
+    #     postService.ts:768-779, blockService.ts:26-27). blocked/blockedBy
+    #     may not exist yet (built by the block-users section); streaming an
+    #     absent subcollection just yields nothing.
+    mirror_map = (
+        ("followers", "following"),   # users/{F}/following/{uid}
+        ("following", "followers"),   # users/{T}/followers/{uid}
+        ("blocked", "blockedBy"),     # users/{T}/blockedBy/{uid}
+        ("blockedBy", "blocked"),     # users/{B}/blocked/{uid}
+    )
+    for own_sub, mirror_sub in mirror_map:
+        try:
+            for edge_doc in user_ref.collection(own_sub).stream():
+                try:
+                    (
+                        firestore_db.collection("users")
+                        .document(edge_doc.id)
+                        .collection(mirror_sub)
+                        .document(uid)
+                        .delete()
+                    )
+                except Exception as e:
+                    errors.append(f"mirror {mirror_sub} on {edge_doc.id}: {e}")
+        except Exception as e:
+            errors.append(f"list {own_sub}: {e}")
+
+    # 2e. Username reservation (usernames/{name}, profileService.ts:37).
+    if username:
+        try:
+            firestore_db.collection("usernames").document(username).delete()
+        except Exception as e:
+            errors.append(f"delete usernames/{username}: {e}")
+
+    # 2f. Token balance doc (tokenBalances/{uid} — tokenService.ts, server.py:3429).
+    try:
+        firestore_db.collection("tokenBalances").document(uid).delete()
+    except Exception as e:
+        errors.append(f"delete tokenBalances/{uid}: {e}")
+
+    # 2g. DM threads containing the user, incl. messages subcollections
+    #     (dmThreads.participantIds — dmService.ts:167).
+    try:
+        dm_query = firestore_db.collection("dmThreads").where(
+            "participantIds", "array_contains", uid
+        )
+        for thread_doc in dm_query.stream():
+            try:
+                delete_doc_recursive(thread_doc.reference)
+            except Exception as e:
+                errors.append(f"delete dmThread {thread_doc.id}: {e}")
+    except Exception as e:
+        errors.append(f"query dmThreads: {e}")
+
+    # 2h. Notifications the user SENT (actorId field, collection-group —
+    #     notificationService.ts:60,70). Notifications TO the user live at
+    #     users/{uid}/notifications and are removed with the user doc in 2i.
+    try:
+        notif_query = firestore_db.collection_group("notifications").where(
+            "actorId", "==", uid
+        )
+        for notif_doc in notif_query.stream():
+            try:
+                notif_doc.reference.delete()
+            except Exception as e:
+                errors.append(f"delete notification {notif_doc.reference.path}: {e}")
+    except Exception as e:
+        errors.append(f"collection-group notifications: {e}")
+
+    # 2i. Collected-shelf docs (top-level "collections", field collectorId —
+    #     postService.ts:493-494). One doc per post the user collected.
+    try:
+        collections_query = firestore_db.collection("collections").where(
+            "collectorId", "==", uid
+        )
+        for coll_doc in collections_query.stream():
+            try:
+                coll_doc.reference.delete()
+            except Exception as e:
+                errors.append(f"delete collection {coll_doc.id}: {e}")
+    except Exception as e:
+        errors.append(f"query collections: {e}")
+
+    # 2j. Circle memberships (top-level "circleMembers", field userId, doc id
+    #     "{slug}_{uid}", each carries a slug — postService.ts:533,539,582-583).
+    #     Best-effort decrement the owning circles/{slug}.memberCount, which IS
+    #     a simple numeric field (postService.ts:65,543,560).
+    try:
+        members_query = firestore_db.collection("circleMembers").where(
+            "userId", "==", uid
+        )
+        for member_doc in members_query.stream():
+            slug = (member_doc.to_dict() or {}).get("slug")
+            try:
+                member_doc.reference.delete()
+                if slug:
+                    firestore_db.collection("circles").document(slug).update(
+                        {"memberCount": FirestoreIncrement(-1)}
+                    )
+            except Exception as e:
+                errors.append(f"delete circleMember {member_doc.id}: {e}")
+    except Exception as e:
+        errors.append(f"query circleMembers: {e}")
+
+    # 2k. Finally the user doc + ALL its subcollections (following, followers,
+    #     blocked, blockedBy, notifications, studioItems, ...).
+    try:
+        delete_doc_recursive(user_ref)
+    except Exception as e:
+        errors.append(f"delete users/{uid}: {e}")
+
+    # 3. GCS cleanup: story blobs (stories/{uid}/, server.py:1710), studio
+    #    blobs incl. thumbnails (studio/{uid}/, server.py:1808/1821), and
+    #    hq_media/{tokenId}[.jpg|.mp4|_thumb.jpg] (server.py:796, 1285, 1310).
+    if gcs_bucket:
+        for prefix in (f"stories/{uid}/", f"studio/{uid}/"):
+            try:
+                for blob in gcs_bucket.list_blobs(prefix=prefix):
+                    blob.delete()
+            except Exception as e:
+                errors.append(f"gcs prefix {prefix}: {e}")
+        for token_id in hq_token_ids:
+            for name in (
+                f"hq_media/{token_id}.jpg",
+                f"hq_media/{token_id}.mp4",
+                f"hq_media/{token_id}_thumb.jpg",
+            ):
+                try:
+                    blob = gcs_bucket.blob(name)
+                    if blob.exists():
+                        blob.delete()
+                except Exception as e:
+                    errors.append(f"gcs {name}: {e}")
+    else:
+        errors.append("gcs not configured, skipped blob cleanup")
+
+    # 4. Firebase Auth account (Admin SDK).
+    try:
+        firebase_auth.delete_user(uid)
+    except Exception as e:
+        errors.append(f"auth delete_user: {e}")
+
+    print(f"Account {uid} deleted with {len(errors)} errors")
+    return jsonify({"deleted": True, "errors": errors})
 
 
 @app.route("/stitch", methods=["POST"])
@@ -2965,21 +3306,9 @@ def stitch_videos():
 
         # Mint on-chain
         user_id_hash = compute_user_id_hash(user_id)
-        nonce = get_nonce()
-        max_fee, max_priority_fee = get_gas_params()
 
         mint_fn = contract.functions.mintToVirtual(user_id_hash, metadata_ipfs_url)
-        txn = mint_fn.build_transaction(
-            {
-                "chainId": w3.eth.chain_id,
-                "gas": 500000,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": nonce,
-            }
-        )
-
-        tx_hash, receipt = send_transaction(txn)
+        tx_hash, receipt = send_contract_transaction(mint_fn, 500000)
         token_id = extract_virtual_mint_token_id(receipt, contract)
 
         # Upload 1080p HQ version to Firebase Storage
@@ -3366,21 +3695,11 @@ def verify_payment():
             if token_contract:
                 user_id_hash = compute_user_id_hash(user_id)
                 amount_wei = w3.to_wei(tokens, "ether")
-                nonce = get_nonce()
-                max_fee, max_priority_fee = get_gas_params()
 
-                txn = token_contract.functions.mintToVirtual(
+                mint_fn = token_contract.functions.mintToVirtual(
                     user_id_hash, amount_wei
-                ).build_transaction(
-                    {
-                        "chainId": w3.eth.chain_id,
-                        "gas": 200000,
-                        "maxFeePerGas": max_fee,
-                        "maxPriorityFeePerGas": max_priority_fee,
-                        "nonce": nonce,
-                    }
                 )
-                send_transaction(txn)
+                send_contract_transaction(mint_fn, 200000)
 
                 # Update last on-chain balance
                 balance_ref.set(
