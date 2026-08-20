@@ -6,6 +6,8 @@ import os
 import io
 import json
 import base64
+import re
+import hashlib
 import subprocess
 import secrets
 import tempfile
@@ -276,6 +278,23 @@ def record_withdrawal(
         )
     except Exception as e:
         print(f"Error recording withdrawal: {e}")
+
+
+PHONE_HASH_SALT = os.environ.get("PHONE_HASH_SALT", "")
+_E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
+
+
+def normalize_phone_e164(raw: str):
+    """Strip spaces/dashes/parens and return an E.164 string, or None if invalid."""
+    if not raw:
+        return None
+    cleaned = re.sub(r"[\s\-()]", "", raw)
+    return cleaned if _E164_RE.match(cleaned) else None
+
+
+def hash_phone_number(e164: str, salt: str) -> str:
+    """Salted SHA-256 of an E.164 phone number — the uniqueness index key."""
+    return hashlib.sha256((salt + e164).encode()).hexdigest()
 
 
 # Alphabet excludes visually ambiguous characters (0/O, 1/I/L).
@@ -2209,9 +2228,13 @@ def create_account():
 
             if "referredBy" in user_data:
                 response_data["referralLinked"] = True
-            else:
+            elif user_data.get("phoneVerified") is True:
                 referrer_id = redeem_referral_code(submitted_referral_code, user_id)
                 response_data["referralLinked"] = referrer_id is not None
+            else:
+                # No verified phone yet -> no referral credit. This is the
+                # anti-fraud gate: leaderboard points require a verified phone.
+                response_data["referralLinked"] = False
         except Exception as e:
             print(f"Referral setup failed (non-blocking): {e}")
 
@@ -2232,6 +2255,83 @@ def create_account():
     except Exception as e:
         print(f"Create account error: {e}")
         return jsonify({"error": f"Error creating account: {e}"}), 500
+
+
+@app.route("/phone/verify", methods=["POST"])
+def phone_verify():
+    """
+    Record an SMS-verified phone number for the authenticated account and
+    enforce one-account-per-phone.
+    Authorization: Bearer <account id token> (the email/password account).
+    Body: { phoneIdToken } — an ID token from a native phone sign-in whose
+    verified phone_number we trust.
+    """
+    account_uid = verify_firebase_token(request)
+    if not account_uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+
+    data = request.get_json() or {}
+    phone_id_token = data.get("phoneIdToken")
+    if not phone_id_token:
+        return jsonify({"error": "Missing phoneIdToken"}), 400
+
+    try:
+        phone_decoded = firebase_auth.verify_id_token(phone_id_token)
+    except Exception:
+        return jsonify({"error": "Invalid phone token"}), 401
+
+    provider = (phone_decoded.get("firebase") or {}).get("sign_in_provider")
+    raw_phone = phone_decoded.get("phone_number")
+    phone_uid = phone_decoded.get("uid")
+    if provider != "phone" or not raw_phone:
+        return jsonify({"error": "Phone token is not a verified phone sign-in"}), 400
+
+    e164 = normalize_phone_e164(raw_phone)
+    if not e164:
+        return jsonify({"error": "Unparseable phone number"}), 400
+
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    phone_hash = hash_phone_number(e164, PHONE_HASH_SALT)
+    phone_ref = firestore_db.collection("phoneNumbers").document(phone_hash)
+    user_ref = firestore_db.collection("users").document(account_uid)
+
+    transaction = firestore_db.transaction()
+
+    @fb_firestore.transactional
+    def claim(txn):
+        snap = phone_ref.get(transaction=txn)
+        if snap.exists:
+            owner = snap.to_dict().get("uid")
+            if owner and owner != account_uid:
+                return False  # phone already registered to another account
+        txn.set(phone_ref, {"uid": account_uid, "createdAt": SERVER_TIMESTAMP})
+        txn.set(
+            user_ref,
+            {"phoneVerified": True, "phoneVerifiedAt": SERVER_TIMESTAMP},
+            merge=True,
+        )
+        return True
+
+    claimed = claim(transaction)
+    if not claimed:
+        return (
+            jsonify(
+                {"error": "This phone number is already in use by another account"}
+            ),
+            409,
+        )
+
+    # Delete the throwaway phone-only Firebase user so phone accounts don't
+    # accumulate. Never delete the real account.
+    if phone_uid and phone_uid != account_uid:
+        try:
+            firebase_auth.delete_user(phone_uid)
+        except Exception as e:
+            print(f"Could not delete throwaway phone user {phone_uid}: {e}")
+
+    return jsonify({"ok": True})
 
 
 @app.route("/referral/leaderboard", methods=["GET"])

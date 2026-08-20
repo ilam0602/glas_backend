@@ -53,3 +53,4 @@ google-cloud-storage>=2.0.0
 cryptography>=41.0.0
 stripe>=8.0.0
 flask-cors>=4.0.0
+pytest>=8.0.0
