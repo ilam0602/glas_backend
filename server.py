@@ -724,19 +724,26 @@ def analyze_video(video_bytes):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def compress_image(base64_str, target_height):
+def compress_image(base64_str, target_width):
     """
-    Decode base64 image, resize to target_height maintaining aspect ratio,
-    re-encode as JPEG with quality 85. Returns base64 string.
+    Decode base64 image, resize so its WIDTH is at most target_width
+    (matching Instagram's baseline, which caps images at 1080px wide),
+    maintaining aspect ratio, re-encode as JPEG with quality 85. Returns
+    base64 string.
+
+    Width, not height, is the governing axis: the app shows media full
+    screen-width, so a portrait photo capped by height came out too narrow
+    (~864px for a 4:5) and got upscaled on Retina screens. Capping width
+    keeps portraits at 1080px wide (e.g. 1080x1350), matching Instagram.
     """
     img_data = base64.b64decode(base64_str)
     img = PILImage.open(io.BytesIO(img_data))
 
     # Only downscale, never upscale
-    if img.height > target_height:
-        ratio = target_height / img.height
-        new_width = int(img.width * ratio)
-        img = img.resize((new_width, target_height), PILImage.LANCZOS)
+    if img.width > target_width:
+        ratio = target_width / img.width
+        new_height = int(img.height * ratio)
+        img = img.resize((target_width, new_height), PILImage.LANCZOS)
 
     # Convert to RGB if needed (e.g. RGBA PNGs)
     if img.mode in ("RGBA", "P"):
@@ -886,8 +893,8 @@ def process_mint_media_item(base64_data, media_type):
             # 1080p version for Firebase Storage (HQ in-app display, keep metadata)
             hq_bytes = compress_video(raw_bytes, target_height=1080, max_fps=60)
         else:
-            lq_base64 = compress_image(base64_data, target_height=720)
-            hq_base64 = compress_image(base64_data, target_height=1080)
+            lq_base64 = compress_image(base64_data, target_width=720)
+            hq_base64 = compress_image(base64_data, target_width=1080)
             hq_bytes = base64.b64decode(hq_base64)
     except Exception as e:
         print(f"Compression failed, using original: {e}")
@@ -1788,7 +1795,7 @@ def story_upload():
             hq_bytes = compress_video(raw_bytes, target_height=1080, max_fps=60)
             ext, content_type = "mp4", "video/mp4"
         else:
-            hq_base64 = compress_image(base64_media, target_height=1080)
+            hq_base64 = compress_image(base64_media, target_width=1080)
             hq_bytes = base64.b64decode(hq_base64)
             ext, content_type = "jpg", "image/jpeg"
     except Exception as e:
