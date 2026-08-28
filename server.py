@@ -361,6 +361,65 @@ def ensure_referral_code(user_id: str, user_data=None):
     return assign_referral_code(user_id), True
 
 
+def _award_points(
+    user_id: str,
+    delta: int,
+    reason: str,
+    dedup_id: str,
+    related_user_id=None,
+    token_id=None,
+) -> bool:
+    """
+    Idempotently credit `delta` points to user_id AND write an audit row to
+    `pointTransactions`, together in one transaction. `dedup_id` is the
+    deterministic ledger doc id — its existence is the once-only guard (daily
+    caps encode the UTC date in the id; one-time credits omit it). Returns True
+    if credited, False if this exact award already happened (dedup hit). Never
+    raises for the dedup case — callers treat False as a silent no-op.
+
+    The ledger is the reconciliation source of truth: every point ever granted
+    has a row here with who/why/when/related-user/tokenId.
+    """
+    if delta <= 0 or not firestore_db:
+        return False
+
+    ledger_ref = firestore_db.collection("pointTransactions").document(dedup_id)
+    user_ref = firestore_db.collection("users").document(user_id)
+    now = datetime.now(timezone.utc)
+
+    @fb_firestore.transactional
+    def _run(txn):
+        if ledger_ref.get(transaction=txn).exists:
+            return False
+        txn.set(
+            ledger_ref,
+            {
+                "userId": user_id,
+                "delta": delta,
+                "reason": reason,
+                "relatedUserId": related_user_id,
+                "tokenId": token_id,
+                "createdAt": now,
+            },
+        )
+        txn.set(user_ref, {"points": FirestoreIncrement(delta)}, merge=True)
+        return True
+
+    return _run(firestore_db.transaction())
+
+
+def post_point_value(media_type: str, duration_seconds) -> int:
+    """Points a single post earns: +1 photo, +2 video >= 30s, 0 shorter video."""
+    if media_type == "video":
+        return (
+            2
+            if duration_seconds is not None
+            and duration_seconds >= LONG_VIDEO_THRESHOLD_SECONDS
+            else 0
+        )
+    return 1
+
+
 def redeem_referral_code(code: str, new_user_id: str):
     """
     Look up a referral code and link the new account to its owner.
@@ -379,78 +438,70 @@ def redeem_referral_code(code: str, new_user_id: str):
     if not referrer_id or referrer_id == new_user_id:
         return None
 
-    # Both writes must land together — a batch (not two independent .set()
-    # calls) so a partial failure can't link referredBy without crediting
-    # the referrer, or vice versa.
-    batch = firestore_db.batch()
-    batch.set(
-        firestore_db.collection("users").document(new_user_id),
-        {"referredBy": referrer_id},
-        merge=True,
+    # Link the referee -> referrer (idempotent), then credit the referrer +1
+    # once EVER for this pair via the ledger. The deterministic refsignup id is
+    # the once-only guard, so concurrent/retried /create-account calls can't
+    # double-credit (the old batch had no such guard).
+    firestore_db.collection("users").document(new_user_id).set(
+        {"referredBy": referrer_id}, merge=True
     )
-    batch.set(
-        firestore_db.collection("users").document(referrer_id),
-        {"points": FirestoreIncrement(1)},
-        merge=True,
+    _award_points(
+        referrer_id,
+        1,
+        "referral_signup",
+        f"refsignup_{referrer_id}_{new_user_id}",
+        related_user_id=new_user_id,
     )
-    batch.commit()
     return referrer_id
 
 
 LONG_VIDEO_THRESHOLD_SECONDS = 30
 
 
-def credit_post_points(user_id: str, media_type: str, duration_seconds):
+def credit_post_points(user_id: str, media_type: str, duration_seconds, token_id=None) -> int:
     """
-    Credit the poster: +1 for a photo, +2 for a video >= 30s, +0 for a
-    shorter video. Returns the number of points credited (0, 1, or 2) so
-    the caller knows whether a referral bonus should also apply.
+    Credit the poster for a SAVED post, at most once per UTC day PER MEDIA TYPE
+    (+1 photo, +2 video >= 30s). Idempotent + logged via the ledger. Returns the
+    points credited this call (the value if it landed, 0 if the daily cap was
+    already hit or the post doesn't qualify).
     """
-    if media_type == "video":
-        points = (
-            2
-            if duration_seconds is not None
-            and duration_seconds >= LONG_VIDEO_THRESHOLD_SECONDS
-            else 0
-        )
-    else:
-        points = 1
-
-    if points > 0:
-        firestore_db.collection("users").document(user_id).set(
-            {"points": FirestoreIncrement(points)}, merge=True
-        )
-    return points
+    value = post_point_value(media_type, duration_seconds)
+    if value <= 0:
+        return 0
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    credited = _award_points(
+        user_id,
+        value,
+        f"post_{media_type}",
+        f"post_{user_id}_{media_type}_{today}",
+        token_id=token_id,
+    )
+    return value if credited else 0
 
 
-def credit_referral_bonus(poster_id: str, points_type: str):
+def credit_referral_bonus(poster_id: str, points_type: str, token_id=None) -> bool:
     """
-    If poster_id was referred by someone, credit that referrer +1
-    (picture) or +2 (video), at most once per UTC calendar day per
-    (referrer, referee) pair. points_type must be 'picture' or 'video'.
+    If poster_id was referred, credit that referrer +1 (picture) / +2 (video),
+    at most once per UTC calendar day per (referrer, referee) pair. Idempotent +
+    logged. Returns True if credited this call. points_type is 'picture'/'video'.
     """
     poster_doc = firestore_db.collection("users").document(poster_id).get()
     if not poster_doc.exists:
-        return
+        return False
 
     referrer_id = poster_doc.to_dict().get("referredBy")
     if not referrer_id:
-        return
+        return False
 
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
-    dedup_ref = firestore_db.collection("referralCredits").document(
-        f"{referrer_id}_{poster_id}_{today}"
-    )
-    try:
-        dedup_ref.create(
-            {"type": points_type, "creditedAt": datetime.now(timezone.utc)}
-        )
-    except AlreadyExists:
-        return  # Already credited today for this referral pair.
-
     bonus = 2 if points_type == "video" else 1
-    firestore_db.collection("users").document(referrer_id).set(
-        {"points": FirestoreIncrement(bonus)}, merge=True
+    return _award_points(
+        referrer_id,
+        bonus,
+        "referral_post_bonus",
+        f"refbonus_{referrer_id}_{poster_id}_{today}",
+        related_user_id=poster_id,
+        token_id=token_id,
     )
 
 
@@ -728,13 +779,18 @@ def compress_image(base64_str, target_width):
     """
     Decode base64 image, resize so its WIDTH is at most target_width
     (matching Instagram's baseline, which caps images at 1080px wide),
-    maintaining aspect ratio, re-encode as JPEG with quality 85. Returns
+    maintaining aspect ratio, re-encode as high-quality JPEG. Returns
     base64 string.
 
     Width, not height, is the governing axis: the app shows media full
     screen-width, so a portrait photo capped by height came out too narrow
     (~864px for a 4:5) and got upscaled on Retina screens. Capping width
     keeps portraits at 1080px wide (e.g. 1080x1350), matching Instagram.
+
+    Encode settings matter as much as size: quality 92 with 4:4:4 chroma
+    (subsampling=0) avoids the ringing/color-bleed on high-contrast edges
+    (text, line art, logos) that quality-85 + default 4:2:0 produced. This is
+    the last lossy pass, so we keep it clean rather than compounding artifacts.
     """
     img_data = base64.b64decode(base64_str)
     img = PILImage.open(io.BytesIO(img_data))
@@ -750,7 +806,7 @@ def compress_image(base64_str, target_width):
         img = img.convert("RGB")
 
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
+    img.save(buf, format="JPEG", quality=92, subsampling=0, optimize=True)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
@@ -1402,20 +1458,27 @@ def mint_nft():
             )
         return jsonify({"error": f"Error sending transaction: {e}"}), 500
 
-    # Points crediting is additive and must never fail an otherwise-successful
-    # mint. One post = one credit, based on the first item (a carousel is one
-    # post, not N posts).
+    # Points are NOT credited here. A mint can succeed on-chain while the client
+    # never saves the post (lost connection), which used to hand out a point for
+    # an invisible post — and a retry minted again for another point. Instead we
+    # record the server-computed point VALUE keyed by tokenId; points are claimed
+    # later via POST /posts/<tokenId>/claim-points, only once the post is actually
+    # saved, capped once/day per media type, and idempotent + logged.
     if user_id and firestore_db:
         try:
-            points_earned = credit_post_points(
-                user_id, media_type, primary["duration_seconds"]
+            firestore_db.collection("mintResults").document(str(token_id)).set(
+                {
+                    "userId": user_id,
+                    "mediaType": media_type,
+                    "durationSeconds": primary["duration_seconds"],
+                    "pointValue": post_point_value(
+                        media_type, primary["duration_seconds"]
+                    ),
+                    "createdAt": datetime.now(timezone.utc),
+                }
             )
-            if points_earned > 0:
-                credit_referral_bonus(
-                    user_id, "video" if media_type == "video" else "picture"
-                )
         except Exception as e:
-            print(f"Points crediting failed (non-blocking): {e}")
+            print(f"mintResults write failed (non-blocking): {e}")
 
     # Upload 1080p HQ versions + video thumbnails (now that we have tokenId).
     # Carousel items are indexed ({token_id}_{index}.{ext}); the legacy shape
@@ -2339,6 +2402,81 @@ def phone_verify():
             print(f"Could not delete throwaway phone user {phone_uid}: {e}")
 
     return jsonify({"ok": True})
+
+
+@app.route("/posts/<token_id>/claim-points", methods=["POST"])
+def claim_post_points(token_id):
+    """
+    Credit points for a post that has ACTUALLY been saved. The client calls this
+    after it writes the post to Firestore. We verify the post exists and is owned
+    by the caller, then credit (once/day per media type, idempotent, logged):
+      - the poster: the server-computed value recorded in mintResults/<tokenId>
+      - their referrer (if any): the referral-post bonus
+    Safe to call repeatedly — daily/idempotent dedup means no double credit, so a
+    lost-connection retry can't farm points.
+    """
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    token_id = str(token_id)
+    post_doc = firestore_db.collection("posts").document(token_id).get()
+    if not post_doc.exists:
+        return jsonify({"error": "Post not found"}), 404
+    if post_doc.to_dict().get("userId") != uid:
+        return jsonify({"error": "Not your post"}), 403
+
+    mint_doc = firestore_db.collection("mintResults").document(token_id).get()
+    if not mint_doc.exists:
+        # Nothing to credit (post predates this system, or mint record missing).
+        return jsonify({"credited": {"self": False, "referral": False}}), 200
+    mint = mint_doc.to_dict()
+    if mint.get("userId") != uid:
+        return jsonify({"error": "Mint owner mismatch"}), 403
+
+    media_type = mint.get("mediaType", "photo")
+    duration_seconds = mint.get("durationSeconds")
+
+    credited_self = credit_post_points(uid, media_type, duration_seconds, token_id) > 0
+    credited_referral = False
+    if post_point_value(media_type, duration_seconds) > 0:
+        credited_referral = credit_referral_bonus(
+            uid, "video" if media_type == "video" else "picture", token_id
+        )
+
+    return (
+        jsonify({"credited": {"self": credited_self, "referral": credited_referral}}),
+        200,
+    )
+
+
+@app.route("/posts/<token_id>", methods=["DELETE"])
+def delete_post(token_id):
+    """
+    Delete a post the caller owns. Owner is verified server-side (defense in
+    depth beyond Firestore rules). Recursively removes the post doc and its
+    subcollections (likes, comments). The on-chain NFT and IPFS media are
+    permanent and are intentionally left as-is; earned points stay too (the
+    pointTransactions ledger keeps the audit trail).
+    """
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    token_id = str(token_id)
+    post_ref = firestore_db.collection("posts").document(token_id)
+    snap = post_ref.get()
+    if not snap.exists:
+        return jsonify({"error": "Post not found"}), 404
+    if snap.to_dict().get("userId") != uid:
+        return jsonify({"error": "Not your post"}), 403
+
+    firestore_db.recursive_delete(post_ref)
+    return jsonify({"success": True}), 200
 
 
 @app.route("/referral/leaderboard", methods=["GET"])
