@@ -454,6 +454,20 @@ def post_point_value(media_type: str, duration_seconds) -> int:
     return 1
 
 
+def autoflag_should_flag(reports_count, likes_count, moderation_status):
+    """User-report auto-flag rule. Only the server calls this.
+
+    Flags when there are at least 5 reports AND reports strictly exceed
+    10% of likes. Posts a moderator already approved are immune so a
+    standing report count cannot instantly re-flag them.
+    """
+    if moderation_status == "approved":
+        return False
+    reports_count = reports_count or 0
+    likes_count = likes_count or 0
+    return reports_count >= 5 and reports_count > likes_count * 0.10
+
+
 def redeem_referral_code(code: str, new_user_id: str):
     """
     Look up a referral code and link the new account to its owner.
@@ -2266,6 +2280,82 @@ def admin_unlock_post():
         return jsonify({"error": f"Error unlocking post: {e}"}), 500
 
 
+VALID_REPORT_REASONS = {"spam", "nudity", "violence", "harassment", "other"}
+
+
+@app.route("/report-post", methods=["POST"])
+def report_post():
+    """
+    POST endpoint for a mobile-app user to report a post.
+    Auth: Firebase ID token (Authorization: Bearer <token>).
+    Body: { tokenId, reason }, reason one of VALID_REPORT_REASONS.
+    Records the reporter's report in /posts/{tokenId}/reports/{uid} (one doc
+    per uid so a reporter can't inflate the count), recounts authoritatively
+    from the subcollection, and applies autoflag_should_flag. Only the server
+    ever writes `flagged`.
+    """
+    # --- auth: Bearer Firebase ID token ---
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"error": "missing bearer token"}), 401
+    id_token = auth_header.split(" ", 1)[1]
+    try:
+        decoded = firebase_auth.verify_id_token(id_token)
+    except Exception:
+        return jsonify({"error": "invalid token"}), 401
+    uid = decoded["uid"]
+    email = decoded.get("email", "")
+
+    # --- validate body ---
+    data = request.get_json(silent=True) or {}
+    token_id = data.get("tokenId")
+    reason = data.get("reason")
+    if token_id is None or reason not in VALID_REPORT_REASONS:
+        return jsonify({"error": "invalid tokenId or reason"}), 400
+    token_id = str(token_id)
+
+    post_ref = firestore_db.collection("posts").document(token_id)
+    snap = post_ref.get()
+    if not snap.exists:
+        return jsonify({"error": "post not found"}), 404
+    post = snap.to_dict() or {}
+
+    # --- record this reporter's report (one doc per uid) ---
+    post_ref.collection("reports").document(uid).set({
+        "reporterId": uid,
+        "reporterEmail": email,
+        "reason": reason,
+        "createdAt": SERVER_TIMESTAMP,
+    })
+
+    # --- authoritative recount from the subcollection ---
+    reason_counts = {}
+    total = 0
+    for rdoc in post_ref.collection("reports").stream():
+        r = rdoc.to_dict() or {}
+        rk = r.get("reason", "other")
+        reason_counts[rk] = reason_counts.get(rk, 0) + 1
+        total += 1
+
+    likes_count = post.get("likesCount", 0) or 0
+    moderation_status = post.get("moderationStatus")
+
+    update = {"reportsCount": total, "reportReasonCounts": reason_counts}
+    flagged = bool(post.get("flagged"))
+    if not flagged and autoflag_should_flag(total, likes_count, moderation_status):
+        flagged = True
+        update.update({
+            "flagged": True,
+            "flagSource": "user_report",
+            "moderationStatus": "pending",
+            "flaggedAt": SERVER_TIMESTAMP,
+            "flagReason": f"Auto-flagged: {total} user reports",
+        })
+
+    post_ref.set(update, merge=True)
+    return jsonify({"reportsCount": total, "flagged": flagged}), 200
+
+
 def mint_story_nft_background(story_id, user_id, media_b64, media_type):
     """
     Daemon-thread mint of a story NFT, run after /story-upload has responded.
@@ -2402,46 +2492,79 @@ def story_upload():
     })
 
 
+def story_blob_path(media_path: str) -> str:
+    """GCS blob path for a story's media, from its stored mediaPath."""
+    return media_path.replace("/media/", "", 1)
+
+
+def is_story_owner(story_data: dict, uid: str) -> bool:
+    """True iff uid is non-empty and owns the story."""
+    return bool(uid) and story_data.get("userId") == uid
+
+
 @app.route("/cleanup-expired-stories", methods=["POST"])
 def cleanup_expired_stories():
     """
-    Deletes stories whose expiresAt has passed: removes the GCS blob,
-    the Firestore doc, and its views subcollection.
-    Called by Cloud Scheduler every 15-30 min. Auth via shared secret header.
+    Expired stories are now retained (owner-only, surfaced in the profile
+    Stories tab) rather than hard-deleted. This endpoint is kept for the
+    existing Cloud Scheduler call but is now a no-op. Permanent deletion
+    is explicit via /delete-story, and account deletion still sweeps a
+    user's stories.
     """
     if not CLEANUP_SECRET or request.headers.get("X-Cleanup-Secret") != CLEANUP_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
 
+    # Stories are now retained after expiry (owner-only, surfaced in the
+    # profile Stories tab). Expiry no longer deletes anything; the client
+    # tray query filters expired stories out (expiresAt > now). Permanent
+    # deletion is explicit via /delete-story, and account deletion still
+    # sweeps a user's stories.
+    return jsonify({"deletedCount": 0, "retained": True})
+
+
+@app.route("/delete-story", methods=["POST"])
+def delete_story():
+    """
+    Permanently delete one of the caller's own stories: GCS blob + the
+    views subcollection + the Firestore doc. Requires a Firebase ID token;
+    only the story owner may delete it.
+    """
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+
     if not firestore_db:
         return jsonify({"error": "Firebase not configured on server"}), 500
 
-    now = datetime.now(timezone.utc)
-    expired_query = firestore_db.collection("stories").where("expiresAt", "<=", now)
-    expired_docs = list(expired_query.stream())
+    data = request.get_json(silent=True) or {}
+    story_id = data.get("storyId")
+    if not story_id:
+        return jsonify({"error": "storyId is required"}), 400
 
-    deleted_count = 0
-    errors = []
-    for story_doc in expired_docs:
-        story_data = story_doc.to_dict()
-        media_path = story_data.get("mediaPath", "")
-        blob_path = media_path.replace("/media/", "", 1)
+    story_ref = firestore_db.collection("stories").document(story_id)
+    snapshot = story_ref.get()
+    if not snapshot.exists:
+        return jsonify({"error": "Story not found"}), 404
 
-        try:
-            if gcs_bucket and blob_path:
-                blob = gcs_bucket.blob(blob_path)
-                if blob.exists():
-                    blob.delete()
+    story_data = snapshot.to_dict()
+    if not is_story_owner(story_data, uid):
+        return jsonify({"error": "Forbidden"}), 403
 
-            views = story_doc.reference.collection("views").stream()
-            for view_doc in views:
-                view_doc.reference.delete()
+    try:
+        blob_path = story_blob_path(story_data.get("mediaPath", ""))
+        if gcs_bucket and blob_path:
+            blob = gcs_bucket.blob(blob_path)
+            if blob.exists():
+                blob.delete()
 
-            story_doc.reference.delete()
-            deleted_count += 1
-        except Exception as e:
-            errors.append({"storyId": story_doc.id, "error": str(e)})
+        for view_doc in story_ref.collection("views").stream():
+            view_doc.reference.delete()
 
-    return jsonify({"deletedCount": deleted_count, "errors": errors})
+        story_ref.delete()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"success": True})
 
 
 @app.route("/studio-items", methods=["GET"])
