@@ -98,6 +98,39 @@ except Exception as e:
     gcs_bucket = None
     print(f"WARNING: GCS client init failed: {e}. HQ media upload disabled.")
 
+# Cloud Tasks: async minting. When all TASKS_* are set, /mint/async enqueues a
+# task that calls /mint/process (so the mint survives the app closing); if not
+# set, /mint/async runs the mint inline so the app still works pre-infra.
+TASKS_PROJECT = os.getenv("TASKS_PROJECT")
+TASKS_LOCATION = os.getenv("TASKS_LOCATION")
+TASKS_QUEUE = os.getenv("TASKS_QUEUE")
+TASKS_TARGET_URL = os.getenv("TASKS_TARGET_URL")  # full URL to /mint/process
+TASKS_INVOKER_SA_EMAIL = os.getenv("TASKS_INVOKER_SA_EMAIL")
+MINT_WORKER_SECRET = os.getenv("MINT_WORKER_SECRET")
+
+_tasks_client = None
+
+
+def _get_tasks_client():
+    global _tasks_client
+    if _tasks_client is None:
+        from google.cloud import tasks_v2
+        _tasks_client = tasks_v2.CloudTasksClient()
+    return _tasks_client
+
+
+def tasks_configured() -> bool:
+    return all(
+        [
+            TASKS_PROJECT,
+            TASKS_LOCATION,
+            TASKS_QUEUE,
+            TASKS_TARGET_URL,
+            TASKS_INVOKER_SA_EMAIL,
+        ]
+    )
+
+
 # Encryption key for private post URLs
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 if not ENCRYPTION_KEY:
@@ -1306,6 +1339,342 @@ def cancel_pending():
         return jsonify({"error": f"Error cancelling transactions: {e}"}), 500
 
 
+class MintError(Exception):
+    """Raised by run_mint_pipeline on failure. Carries tx_hash when a mint
+    transaction was sent but confirmation failed, so callers can surface it."""
+
+    def __init__(self, message, tx_hash=None):
+        super().__init__(message)
+        self.tx_hash = tx_hash
+
+
+def run_mint_pipeline(items_in, user_id, wallet_address, is_private, is_carousel):
+    """
+    Core mint: compress+pin+moderate each item, pin metadata, mint on-chain,
+    upload HQ media. Returns the response_data dict. Raises MintError on failure.
+
+    Does NOT create the Firestore post or credit points — callers own that:
+    the sync /mint keeps the legacy client-driven savePost; the async worker
+    (/mint/process) does it server-side via save_post_server + _credit_post.
+    """
+    # 1. Compress + pin to IPFS + moderate every item (order preserved)
+    processed = []
+    for index, item in enumerate(items_in):
+        try:
+            processed.append(process_mint_media_item(item["image"], item["mediaType"]))
+        except Exception as e:
+            print(f"Item {index} Pinata upload failed: {e}")
+            raise MintError(f"Error uploading item {index} to Pinata: {e}")
+
+    primary = processed[0]
+    media_type = primary["media_type"]
+
+    # 1c. Combine per-item AI analysis: flagged if ANY item flags.
+    flagged_analyses = [p["analysis"] for p in processed if p["analysis"].get("flagged")]
+    all_tags = []
+    for p in processed:
+        for tag in p["analysis"].get("tags", []):
+            if tag not in all_tags:
+                all_tags.append(tag)
+    analysis = {
+        "flagged": bool(flagged_analyses),
+        "reason": flagged_analyses[0].get("reason", "") if flagged_analyses else "",
+        "tags": all_tags[:5],
+        "description": primary["analysis"].get("description", ""),
+    }
+
+    # 2. Create + pin ERC-721 metadata JSON
+    try:
+        token_name = "AuthenSnap Video" if media_type == "video" else "AuthenSnap Photo"
+        metadata_ipfs_url = pin_metadata_to_pinata(
+            primary["ipfs_url"],
+            token_name,
+            media_type=media_type,
+            media_items=(
+                [(p["ipfs_url"], p["media_type"]) for p in processed]
+                if is_carousel
+                else None
+            ),
+        )
+        print(f"Metadata uploaded to IPFS: {metadata_ipfs_url}")
+    except Exception as e:
+        print(e)
+        raise MintError(f"Error uploading metadata to Pinata: {e}")
+
+    # 3. Build + send the mint transaction
+    try:
+        if user_id:
+            user_id_hash = compute_user_id_hash(user_id)
+            mint_fn = contract.functions.mintToVirtual(user_id_hash, metadata_ipfs_url)
+        else:
+            recipient = Web3.to_checksum_address(wallet_address)
+            mint_fn = contract.get_function_by_signature("mint(address,string)")
+            mint_fn = mint_fn(recipient, metadata_ipfs_url)
+    except Exception as e:
+        print(e)
+        raise MintError(f"Error building transaction: {e}")
+
+    try:
+        tx_hash, receipt = send_contract_transaction(mint_fn, 500000)
+        if user_id:
+            token_id = extract_virtual_mint_token_id(receipt, contract)
+        else:
+            token_id = extract_token_id_from_receipt(receipt, contract)
+    except Exception as e:
+        print(f"Error details: {e}")
+        raise MintError(str(e), tx_hash=tx_hash.hex() if "tx_hash" in locals() else None)
+
+    # Record the server-computed point value keyed by tokenId (legacy claim flow).
+    if user_id and firestore_db:
+        try:
+            firestore_db.collection("mintResults").document(str(token_id)).set(
+                {
+                    "userId": user_id,
+                    "mediaType": media_type,
+                    "durationSeconds": primary["duration_seconds"],
+                    "pointValue": post_point_value(media_type, primary["duration_seconds"]),
+                    "createdAt": datetime.now(timezone.utc),
+                }
+            )
+        except Exception as e:
+            print(f"mintResults write failed (non-blocking): {e}")
+
+    # Upload 1080p HQ versions + video thumbnails (now that we have tokenId).
+    media_items_out = []
+    for index, p in enumerate(processed):
+        base_name = f"{token_id}_{index}" if is_carousel else f"{token_id}"
+        if p["media_type"] == "video":
+            ext, content_type = "mp4", "video/mp4"
+        else:
+            ext, content_type = "jpg", "image/jpeg"
+
+        item_hq_url = upload_to_firebase_storage(
+            p["hq_bytes"], f"{base_name}.{ext}", content_type
+        )
+        if item_hq_url:
+            print(f"HQ media (1080p) uploaded to Firebase Storage: {item_hq_url}")
+
+        item_thumb_url = None
+        if p["media_type"] == "video":
+            thumb_bytes = generate_video_thumbnail_bytes(p["raw_bytes"])
+            if thumb_bytes:
+                item_thumb_url = upload_to_firebase_storage(
+                    thumb_bytes, f"{base_name}_thumb.jpg", "image/jpeg"
+                )
+                if item_thumb_url:
+                    print(f"Video thumbnail uploaded: {item_thumb_url}")
+
+        # For private posts, encrypt URLs before returning.
+        item_ipfs = p["ipfs_url"]
+        if is_private:
+            item_ipfs = encrypt_url(item_ipfs)
+            if item_hq_url:
+                item_hq_url = encrypt_url(item_hq_url)
+
+        media_items_out.append(
+            {
+                "ipfs_uri": item_ipfs,
+                "hqMediaUrl": item_hq_url,
+                "thumbnailUrl": item_thumb_url,
+                "mediaType": p["media_type"],
+            }
+        )
+
+    first = media_items_out[0]
+    response_data = {
+        "transaction_hash": tx_hash.hex(),
+        "token_id": token_id,
+        "ipfs_uri": first["ipfs_uri"],
+        "metadata_uri": metadata_ipfs_url,
+        "mediaType": media_type,
+        "isPrivate": is_private,
+        "flagged": analysis["flagged"],
+        "flag_reason": analysis["reason"],
+        "tags": analysis["tags"],
+        "description": analysis["description"],
+        "media_items": media_items_out,
+        "mediaCount": len(media_items_out),
+        "receipt": make_json_serializable(receipt),
+        # Extra (harmless to old clients): the async worker uses these to credit.
+        "duration_seconds": primary["duration_seconds"],
+    }
+    if first["hqMediaUrl"]:
+        response_data["hqMediaUrl"] = first["hqMediaUrl"]
+    if first["thumbnailUrl"]:
+        response_data["thumbnailUrl"] = first["thumbnailUrl"]
+    if user_id:
+        response_data["user_id"] = user_id
+    else:
+        response_data["wallet_address"] = Web3.to_checksum_address(wallet_address)
+    return response_data
+
+
+def _user_email(user_id: str) -> str:
+    try:
+        doc = firestore_db.collection("users").document(user_id).get()
+        if doc.exists and doc.to_dict().get("email"):
+            return doc.to_dict()["email"]
+    except Exception:
+        pass
+    try:
+        return firebase_auth.get_user(user_id).email or ""
+    except Exception:
+        return ""
+
+
+def save_post_server(token_id, response_data, user_id, is_private, caption, circle_slug):
+    """Server-side equivalent of the client savePost — writes /posts/{token_id}
+    with the same schema, so the async flow doesn't depend on the client staying
+    alive to create the post."""
+    if not firestore_db:
+        return
+    media_items = response_data.get("media_items", [])
+    post = {
+        "tokenId": token_id,
+        "walletAddress": "",
+        "ipfsUrl": response_data.get("ipfs_uri", ""),
+        "userId": user_id,
+        "userEmail": _user_email(user_id),
+        "createdAt": SERVER_TIMESTAMP,
+        "transactionHash": response_data.get("transaction_hash", ""),
+        "likesCount": 0,
+        "commentsCount": 0,
+        "mediaType": response_data.get("mediaType", "photo"),
+        "isPrivate": bool(is_private),
+        "rankScore": 0.354,
+        "flagged": bool(response_data.get("flagged")),
+    }
+    if response_data.get("hqMediaUrl"):
+        post["hqMediaUrl"] = response_data["hqMediaUrl"]
+    if response_data.get("thumbnailUrl"):
+        post["thumbnailUrl"] = response_data["thumbnailUrl"]
+    if caption:
+        post["caption"] = caption
+    if circle_slug:
+        post["circleSlug"] = circle_slug
+    if len(media_items) > 1:
+        post["media"] = [
+            {
+                "ipfsUrl": m.get("ipfs_uri", ""),
+                "mediaType": m.get("mediaType", "photo"),
+                **({"hqMediaUrl": m["hqMediaUrl"]} if m.get("hqMediaUrl") else {}),
+                **({"thumbnailUrl": m["thumbnailUrl"]} if m.get("thumbnailUrl") else {}),
+            }
+            for m in media_items
+        ]
+        post["mediaCount"] = len(media_items)
+    if response_data.get("flagged"):
+        post["flagReason"] = response_data.get("flag_reason", "")
+        post["flaggedAt"] = SERVER_TIMESTAMP
+        post["flagSource"] = "ai"
+        post["moderationStatus"] = "pending"
+    if response_data.get("tags"):
+        post["tags"] = response_data["tags"]
+    if response_data.get("description"):
+        post["description"] = response_data["description"]
+    firestore_db.collection("posts").document(str(token_id)).set(post)
+
+
+def _credit_post(user_id, response_data):
+    """Credit the poster + their referrer for a saved post (daily-capped,
+    idempotent, ledgered). Non-blocking."""
+    token_id = response_data.get("token_id")
+    media_type = response_data.get("mediaType", "photo")
+    duration = response_data.get("duration_seconds")
+    try:
+        earned = credit_post_points(user_id, media_type, duration, token_id)
+        if earned > 0:
+            credit_referral_bonus(
+                user_id, "video" if media_type == "video" else "picture", token_id
+            )
+    except Exception as e:
+        print(f"points crediting failed (non-blocking): {e}")
+
+
+def _stash_mint_upload(job_id, index, b64):
+    gcs_bucket.blob(f"mint_uploads/{job_id}/{index}").upload_from_string(
+        b64, content_type="text/plain"
+    )
+
+
+def _read_mint_upload(job_id, index):
+    return gcs_bucket.blob(f"mint_uploads/{job_id}/{index}").download_as_text()
+
+
+def _cleanup_mint_upload(job_id):
+    try:
+        for blob in gcs_client.list_blobs(
+            GCS_BUCKET_NAME, prefix=f"mint_uploads/{job_id}/"
+        ):
+            blob.delete()
+    except Exception as e:
+        print(f"mint upload cleanup failed (non-blocking): {e}")
+
+
+def enqueue_mint_job(job_id):
+    from google.cloud import tasks_v2
+
+    client = _get_tasks_client()
+    parent = client.queue_path(TASKS_PROJECT, TASKS_LOCATION, TASKS_QUEUE)
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": TASKS_TARGET_URL,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"jobId": job_id}).encode(),
+            "oidc_token": {
+                "service_account_email": TASKS_INVOKER_SA_EMAIL,
+                "audience": TASKS_TARGET_URL,
+            },
+        }
+    }
+    client.create_task(request={"parent": parent, "task": task})
+
+
+def verify_mint_worker(req) -> bool:
+    """Only Cloud Tasks (or a local caller with the shared secret) may hit
+    /mint/process. Accept a matching X-Mint-Secret, or a valid OIDC token minted
+    for the invoker service account."""
+    if MINT_WORKER_SECRET and req.headers.get("X-Mint-Secret") == MINT_WORKER_SECRET:
+        return True
+    auth_header = req.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer ") and TASKS_INVOKER_SA_EMAIL and TASKS_TARGET_URL:
+        token = auth_header.split("Bearer ", 1)[1]
+        try:
+            from google.oauth2 import id_token as google_id_token
+            from google.auth.transport import requests as google_requests
+
+            claims = google_id_token.verify_oauth2_token(
+                token, google_requests.Request(), audience=TASKS_TARGET_URL
+            )
+            if claims.get("email") == TASKS_INVOKER_SA_EMAIL and claims.get(
+                "email_verified"
+            ):
+                return True
+        except Exception as e:
+            print(f"OIDC verify failed: {e}")
+    return False
+
+
+def _normalize_mint_items(data):
+    """Turn either request shape into an ordered [{image, mediaType}] list, or
+    raise ValueError with a client-facing message."""
+    if "media" in data:
+        media_param = data["media"]
+        if not isinstance(media_param, list) or not (1 <= len(media_param) <= 10):
+            raise ValueError("media must be a list of 1-10 items")
+        items = []
+        for m in media_param:
+            if not isinstance(m, dict) or "image" not in m:
+                raise ValueError("Each media item needs an image field")
+            item_type = m.get("mediaType", "photo")
+            if item_type not in ("photo", "video"):
+                raise ValueError(f"Invalid mediaType: {item_type}")
+            items.append({"image": m["image"], "mediaType": item_type})
+        return items, True
+    return [{"image": data["image"], "mediaType": data.get("mediaType", "photo")}], False
+
+
 @app.route("/mint", methods=["POST"])
 def mint_nft():
     """
@@ -1366,193 +1735,214 @@ def mint_nft():
         if not uid or uid != user_id:
             return jsonify({"error": "Missing or invalid authorization token"}), 401
 
-    # 1. Compress + pin to IPFS + moderate every item (order preserved)
-    processed = []
-    for index, item in enumerate(items_in):
-        try:
-            processed.append(
-                process_mint_media_item(item["image"], item["mediaType"])
-            )
-        except Exception as e:
-            print(f"Item {index} Pinata upload failed: {e}")
-            return (
-                jsonify({"error": f"Error uploading item {index} to Pinata: {e}"}),
-                500,
-            )
-
-    primary = processed[0]
-    media_type = primary["media_type"]
-
-    # 1c. Combine per-item AI analysis: flagged if ANY item flags.
-    flagged_analyses = [
-        p["analysis"] for p in processed if p["analysis"].get("flagged")
-    ]
-    all_tags = []
-    for p in processed:
-        for tag in p["analysis"].get("tags", []):
-            if tag not in all_tags:
-                all_tags.append(tag)
-    analysis = {
-        "flagged": bool(flagged_analyses),
-        "reason": flagged_analyses[0].get("reason", "") if flagged_analyses else "",
-        "tags": all_tags[:5],
-        "description": primary["analysis"].get("description", ""),
-    }
-
-    # 2. Create and pin ERC-721 metadata JSON (image = first item; carousel
-    #    requests also list every item in a "media" array)
     try:
-        token_name = (
-            "AuthenSnap Video" if media_type == "video" else "AuthenSnap Photo"
+        response_data = run_mint_pipeline(
+            items_in, user_id, wallet_address, is_private, is_carousel
         )
-        metadata_ipfs_url = pin_metadata_to_pinata(
-            primary["ipfs_url"],
-            token_name,
-            media_type=media_type,
-            media_items=(
-                [(p["ipfs_url"], p["media_type"]) for p in processed]
-                if is_carousel
-                else None
-            ),
-        )
-        print(f"Metadata uploaded to IPFS: {metadata_ipfs_url}")
-    except Exception as e:
-        print(e)
-        return jsonify({"error": f"Error uploading metadata to Pinata: {e}"}), 500
-
-    # 3. Build and send transaction through the tx lock (one mint per post) —
-    #    send_contract_transaction (Task C1) owns nonce + gas handling.
-    try:
-        if user_id:
-            user_id_hash = compute_user_id_hash(user_id)
-            mint_fn = contract.functions.mintToVirtual(
-                user_id_hash, metadata_ipfs_url
-            )
-        else:
-            recipient = Web3.to_checksum_address(wallet_address)
-            mint_fn = contract.get_function_by_signature("mint(address,string)")
-            mint_fn = mint_fn(recipient, metadata_ipfs_url)
-    except Exception as e:
-        print(e)
-        return jsonify({"error": f"Error building transaction: {e}"}), 500
-
-    try:
-        tx_hash, receipt = send_contract_transaction(mint_fn, 500000)
-
-        if user_id:
-            token_id = extract_virtual_mint_token_id(receipt, contract)
-        else:
-            token_id = extract_token_id_from_receipt(receipt, contract)
-    except Exception as e:
-        print(f"Error details: {e}")
-        if "tx_hash" in locals():
+    except MintError as e:
+        if e.tx_hash:
             return (
                 jsonify(
                     {
                         "error": f"Transaction timeout or error: {e}",
-                        "transaction_hash": tx_hash.hex(),
-                        "check_status": f"https://sepolia.etherscan.io/tx/{tx_hash.hex()}",
+                        "transaction_hash": e.tx_hash,
+                        "check_status": f"https://sepolia.etherscan.io/tx/{e.tx_hash}",
                     }
                 ),
                 500,
             )
-        return jsonify({"error": f"Error sending transaction: {e}"}), 500
-
-    # Points are NOT credited here. A mint can succeed on-chain while the client
-    # never saves the post (lost connection), which used to hand out a point for
-    # an invisible post — and a retry minted again for another point. Instead we
-    # record the server-computed point VALUE keyed by tokenId; points are claimed
-    # later via POST /posts/<tokenId>/claim-points, only once the post is actually
-    # saved, capped once/day per media type, and idempotent + logged.
-    if user_id and firestore_db:
-        try:
-            firestore_db.collection("mintResults").document(str(token_id)).set(
-                {
-                    "userId": user_id,
-                    "mediaType": media_type,
-                    "durationSeconds": primary["duration_seconds"],
-                    "pointValue": post_point_value(
-                        media_type, primary["duration_seconds"]
-                    ),
-                    "createdAt": datetime.now(timezone.utc),
-                }
-            )
-        except Exception as e:
-            print(f"mintResults write failed (non-blocking): {e}")
-
-    # Upload 1080p HQ versions + video thumbnails (now that we have tokenId).
-    # Carousel items are indexed ({token_id}_{index}.{ext}); the legacy shape
-    # keeps {token_id}.{ext} so existing posts/URLs are unaffected.
-    media_items_out = []
-    for index, p in enumerate(processed):
-        base_name = f"{token_id}_{index}" if is_carousel else f"{token_id}"
-        if p["media_type"] == "video":
-            ext, content_type = "mp4", "video/mp4"
-        else:
-            ext, content_type = "jpg", "image/jpeg"
-
-        item_hq_url = upload_to_firebase_storage(
-            p["hq_bytes"], f"{base_name}.{ext}", content_type
-        )
-        if item_hq_url:
-            print(f"HQ media (1080p) uploaded to Firebase Storage: {item_hq_url}")
-
-        item_thumb_url = None
-        if p["media_type"] == "video":
-            thumb_bytes = generate_video_thumbnail_bytes(p["raw_bytes"])
-            if thumb_bytes:
-                item_thumb_url = upload_to_firebase_storage(
-                    thumb_bytes, f"{base_name}_thumb.jpg", "image/jpeg"
-                )
-                if item_thumb_url:
-                    print(f"Video thumbnail uploaded: {item_thumb_url}")
-
-        # For private posts, encrypt URLs before returning to client
-        item_ipfs = p["ipfs_url"]
-        if is_private:
-            item_ipfs = encrypt_url(item_ipfs)
-            if item_hq_url:
-                item_hq_url = encrypt_url(item_hq_url)
-
-        media_items_out.append(
-            {
-                "ipfs_uri": item_ipfs,
-                "hqMediaUrl": item_hq_url,
-                "thumbnailUrl": item_thumb_url,
-                "mediaType": p["media_type"],
-            }
-        )
-
-    first = media_items_out[0]
-
-    # Legacy fields mirror item 0 so existing clients keep working unchanged.
-    response_data = {
-        "transaction_hash": tx_hash.hex(),
-        "token_id": token_id,
-        "ipfs_uri": first["ipfs_uri"],
-        "metadata_uri": metadata_ipfs_url,
-        "mediaType": media_type,
-        "isPrivate": is_private,
-        "flagged": analysis["flagged"],
-        "flag_reason": analysis["reason"],
-        "tags": analysis["tags"],
-        "description": analysis["description"],
-        "media_items": media_items_out,
-        "mediaCount": len(media_items_out),
-        "receipt": make_json_serializable(receipt),
-    }
-
-    if first["hqMediaUrl"]:
-        response_data["hqMediaUrl"] = first["hqMediaUrl"]
-    if first["thumbnailUrl"]:
-        response_data["thumbnailUrl"] = first["thumbnailUrl"]
-
-    if user_id:
-        response_data["user_id"] = user_id
-    else:
-        response_data["wallet_address"] = Web3.to_checksum_address(wallet_address)
+        return jsonify({"error": str(e)}), 500
 
     return jsonify(response_data)
+
+
+@app.route("/mint/async", methods=["POST"])
+def mint_async():
+    """
+    Async post: the client uploads the image + metadata and gets an instant 202
+    so it can lock/close the phone; the slow on-chain mint runs server-side via
+    Cloud Tasks (/mint/process). If Cloud Tasks isn't configured, falls back to
+    running inline so the app still works before the infra is wired up.
+    """
+    data = request.get_json()
+    if not data or ("image" not in data and "media" not in data):
+        return jsonify({"error": "Missing image or media in request body"}), 400
+
+    user_id = data.get("userId")
+    is_private = data.get("isPrivate", False)
+    caption = (data.get("caption") or "").strip() or None
+    circle_slug = data.get("circleSlug") or None
+
+    try:
+        items_in, is_carousel = _normalize_mint_items(data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    if not user_id:
+        return jsonify({"error": "Missing userId"}), 400
+    uid = verify_firebase_token(request)
+    if not uid or uid != user_id:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    # Idempotency: the client sends a stable uploadId, which IS the mintJobs doc
+    # id. Only the first request for an uploadId creates the job — a retry with
+    # the same id returns the existing job instead of minting again, so a post
+    # can NEVER be created twice (even across app restarts / lost acks).
+    upload_id = data.get("uploadId") or uuid.uuid4().hex
+    job_ref = firestore_db.collection("mintJobs").document(upload_id)
+
+    def _existing_job_response():
+        d = job_ref.get().to_dict() or {}
+        out = {"jobId": upload_id, "status": d.get("status", "queued")}
+        if d.get("tokenId") is not None:
+            out["token_id"] = d["tokenId"]
+        return out
+
+    # Fallback: no queue configured (or no storage) → run inline so posting
+    # still works; it just won't survive the app closing mid-mint.
+    if not tasks_configured() or not gcs_bucket:
+        try:
+            job_ref.create(
+                {
+                    "status": "processing",
+                    "userId": user_id,
+                    "isPrivate": bool(is_private),
+                    "caption": caption,
+                    "circleSlug": circle_slug,
+                    "createdAt": SERVER_TIMESTAMP,
+                }
+            )
+        except AlreadyExists:
+            return jsonify(_existing_job_response()), 200
+        try:
+            response_data = run_mint_pipeline(
+                items_in, user_id, None, is_private, is_carousel
+            )
+        except MintError as e:
+            job_ref.update({"status": "failed", "error": str(e)})
+            return jsonify({"error": str(e)}), 500
+        token_id = response_data["token_id"]
+        save_post_server(
+            token_id, response_data, user_id, is_private, caption, circle_slug
+        )
+        _credit_post(user_id, response_data)
+        job_ref.update(
+            {"status": "done", "tokenId": token_id, "finishedAt": SERVER_TIMESTAMP}
+        )
+        return (
+            jsonify({"jobId": upload_id, "status": "done", "token_id": token_id}),
+            200,
+        )
+
+    # Async: dedup-create the job, stash the upload, enqueue the worker.
+    try:
+        job_ref.create(
+            {
+                "status": "queued",
+                "userId": user_id,
+                "isPrivate": bool(is_private),
+                "caption": caption,
+                "circleSlug": circle_slug,
+                "isCarousel": is_carousel,
+                "itemCount": len(items_in),
+                "itemTypes": [it["mediaType"] for it in items_in],
+                "createdAt": SERVER_TIMESTAMP,
+            }
+        )
+    except AlreadyExists:
+        return jsonify(_existing_job_response()), 200
+    try:
+        for i, it in enumerate(items_in):
+            _stash_mint_upload(upload_id, i, it["image"])
+        enqueue_mint_job(upload_id)
+    except Exception as e:
+        print(f"[mint/async] enqueue failed: {e}")
+        # Roll back so a retry can cleanly re-create the job.
+        try:
+            job_ref.delete()
+        except Exception:
+            pass
+        _cleanup_mint_upload(upload_id)
+        return jsonify({"error": f"Could not queue upload: {e}"}), 500
+    return jsonify({"jobId": upload_id, "status": "queued"}), 202
+
+
+@app.route("/mint/process", methods=["POST"])
+def mint_process():
+    """
+    Cloud Tasks worker: runs the slow mint for a queued job, then creates the
+    post + credits points server-side. Only Cloud Tasks (OIDC) or a caller with
+    the shared secret may invoke it. Never retried (returns 200 even on failure)
+    so a re-delivered task can't double-mint.
+    """
+    if not verify_mint_worker(request):
+        return jsonify({"error": "Unauthorized"}), 403
+    if not firestore_db or not gcs_bucket:
+        return jsonify({"error": "Server not configured"}), 500
+
+    data = request.get_json(silent=True) or {}
+    job_id = data.get("jobId")
+    if not job_id:
+        return jsonify({"error": "Missing jobId"}), 400
+
+    job_ref = firestore_db.collection("mintJobs").document(job_id)
+
+    # Claim the job transactionally so a re-delivered task can't double-mint.
+    @fb_firestore.transactional
+    def _claim(txn):
+        snap = job_ref.get(transaction=txn)
+        if not snap.exists:
+            return None
+        d = snap.to_dict()
+        if d.get("status") != "queued":
+            return False
+        txn.update(job_ref, {"status": "processing", "startedAt": SERVER_TIMESTAMP})
+        return d
+
+    job = _claim(firestore_db.transaction())
+    if job is None:
+        return jsonify({"error": "Job not found"}), 404
+    if job is False:
+        return jsonify({"status": "skipped"}), 200
+
+    user_id = job["userId"]
+    is_private = job.get("isPrivate", False)
+    caption = job.get("caption")
+    circle_slug = job.get("circleSlug")
+    is_carousel = job.get("isCarousel", False)
+    item_count = job.get("itemCount", 1)
+    item_types = job.get("itemTypes", ["photo"])
+
+    try:
+        items_in = []
+        for i in range(item_count):
+            b64 = _read_mint_upload(job_id, i)
+            mtype = item_types[i] if i < len(item_types) else "photo"
+            items_in.append({"image": b64, "mediaType": mtype})
+        response_data = run_mint_pipeline(
+            items_in, user_id, None, is_private, is_carousel
+        )
+        token_id = response_data["token_id"]
+        save_post_server(
+            token_id, response_data, user_id, is_private, caption, circle_slug
+        )
+        _credit_post(user_id, response_data)
+        job_ref.update(
+            {"status": "done", "tokenId": token_id, "finishedAt": SERVER_TIMESTAMP}
+        )
+    except Exception as e:
+        print(f"[mint/process] job {job_id} failed: {e}")
+        job_ref.update(
+            {"status": "failed", "error": str(e), "finishedAt": SERVER_TIMESTAMP}
+        )
+        _cleanup_mint_upload(job_id)
+        return jsonify({"status": "failed", "error": str(e)}), 200
+
+    _cleanup_mint_upload(job_id)
+    return jsonify({"status": "done", "tokenId": token_id}), 200
 
 
 @app.route("/media/<path:blob_path>", methods=["GET", "HEAD"])
@@ -1766,6 +2156,81 @@ def unlock_post():
 
     except Exception as e:
         print(f"Unlock post error: {e}")
+        return jsonify({"error": f"Error unlocking post: {e}"}), 500
+
+
+def _get_admin_emails():
+    """Comma-separated allow-list of moderator emails from MODERATION_ADMIN_EMAILS."""
+    raw = os.getenv("MODERATION_ADMIN_EMAILS", "")
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
+
+
+@app.route("/admin/unlock-post", methods=["POST"])
+def admin_unlock_post():
+    """
+    POST endpoint for the moderation client to decrypt private post URLs.
+    Auth: Firebase ID token (Authorization: Bearer <token>) whose email is in
+    the MODERATION_ADMIN_EMAILS allow-list. Unlike /unlock-post this does not
+    require ownership/following -- it is for moderators reviewing any post.
+    Body: { tokenId }
+    Returns decrypted ipfsUrl, hqMediaUrl, thumbnailUrl, mediaType (+ media[]).
+    """
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    # Verify the caller is an authenticated admin.
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing bearer token"}), 401
+    try:
+        decoded = firebase_auth.verify_id_token(auth_header.split("Bearer ")[1])
+    except Exception:
+        return jsonify({"error": "Invalid or expired token"}), 401
+
+    admin_emails = _get_admin_emails()
+    caller_email = (decoded.get("email") or "").lower()
+    if not admin_emails:
+        return jsonify({"error": "Server has no MODERATION_ADMIN_EMAILS configured"}), 500
+    if caller_email not in admin_emails:
+        return jsonify({"error": "Not authorized"}), 403
+
+    data = request.get_json()
+    if not data or "tokenId" not in data:
+        return jsonify({"error": "Missing tokenId"}), 400
+    token_id = str(data["tokenId"])
+
+    def _maybe_decrypt(value):
+        if not value:
+            return ""
+        try:
+            return decrypt_url(value)
+        except Exception:
+            return value  # old/unencrypted value -- return as stored
+
+    try:
+        post_doc = firestore_db.collection("posts").document(token_id).get()
+        if not post_doc.exists:
+            return jsonify({"error": "Post not found"}), 404
+        post_data = post_doc.to_dict()
+
+        response = {
+            "ipfsUrl": _maybe_decrypt(post_data.get("ipfsUrl", "")),
+            "hqMediaUrl": _maybe_decrypt(post_data.get("hqMediaUrl", "")),
+            "thumbnailUrl": _maybe_decrypt(post_data.get("thumbnailUrl", "")),
+            "mediaType": post_data.get("mediaType", "photo"),
+        }
+        unlocked_media = []
+        for item in post_data.get("media") or []:
+            entry = dict(item)
+            for key in ("ipfsUrl", "hqMediaUrl", "thumbnailUrl"):
+                if entry.get(key):
+                    entry[key] = _maybe_decrypt(entry[key])
+            unlocked_media.append(entry)
+        if unlocked_media:
+            response["media"] = unlocked_media
+        return jsonify(response)
+    except Exception as e:
+        print(f"Admin unlock post error: {e}")
         return jsonify({"error": f"Error unlocking post: {e}"}), 500
 
 
