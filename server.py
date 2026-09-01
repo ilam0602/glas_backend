@@ -24,6 +24,7 @@ from PIL import Image as PILImage
 import firebase_admin
 from firebase_admin import credentials, storage, firestore as fb_firestore
 from firebase_admin import auth as firebase_auth
+from firebase_admin import messaging
 from google.cloud.firestore_v1.transforms import Increment as FirestoreIncrement
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 from google.api_core.exceptions import AlreadyExists, NotFound
@@ -240,11 +241,22 @@ CORS(app, origins=[
 # GLAS Withdrawal Constants
 # ============================================================
 DEFAULT_COLLECT_PRICE = 5  # default price (VW) to collect a post
+PLATFORM_COLLECT_CUT = 0.5  # platform's cut of a collect, mirrors client collectSplit()
+SYNC_THRESHOLD = 1000  # creator earnings delta that triggers an on-chain balance sync
 STABLE_TOKEN_USD_RATE = 1000  # 1000 stable tokens = $1
 WITHDRAWAL_FEE_PERCENT = 0.05  # 5% fee
 DAILY_WITHDRAWAL_CAP_USD = 50.0  # $50/day per user
 POOL_DRAIN_CAP_PERCENT = 0.10  # max 10% of pool per withdrawal
 BURN_ADDRESS = "0x000000000000000000000000000000000000dEaD"
+
+
+def collect_split(price):
+    """Collect price -> (effective_price, creator_earns, platform_cut).
+    Mirrors the client collectSplit(): p=max(0,price); platform=min(0.5,p); creator=p-platform."""
+    p = max(0, price)
+    platform_cut = min(PLATFORM_COLLECT_CUT, p)
+    creator_earns = p - platform_cut
+    return (p, creator_earns, platform_cut)
 
 # ============================================================
 # Explore Feed Ranking Constants
@@ -2567,6 +2579,127 @@ def delete_story():
     return jsonify({"success": True})
 
 
+_TYPE_TO_GROUP = {
+    "like": "likes",
+    "comment": "comments",
+    "reply": "comments",
+    "comment_like": "comments",
+    "mention": "mentions",
+    "follow": "follows",
+    "collect": "collects",
+    "dm": "dms",
+}
+
+
+def group_for_type(ntype: str):
+    """Preference group a notification type belongs to, or None if unknown."""
+    return _TYPE_TO_GROUP.get(ntype)
+
+
+def pref_allows(prefs: dict, ntype: str) -> bool:
+    """True if the recipient's prefs permit this type. Missing key = enabled."""
+    group = group_for_type(ntype)
+    if group is None:
+        return False
+    return prefs.get(group, True) is not False
+
+
+def _push_copy(ntype: str, actor_name: str) -> str:
+    """Notification body text for a type. Title is the app name (OS-provided)."""
+    return {
+        "like": f"{actor_name} liked your photo",
+        "comment": f"{actor_name} commented on your photo",
+        "reply": f"{actor_name} replied to you",
+        "comment_like": f"{actor_name} liked your comment",
+        "follow": f"{actor_name} started following you",
+        "collect": f"{actor_name} collected your photo",
+        "mention": f"{actor_name} mentioned you",
+        "dm": f"{actor_name} sent you a message",
+    }.get(ntype, f"{actor_name} sent you a notification")
+
+
+@app.route("/push/notify", methods=["POST"])
+def push_notify():
+    """
+    Send a push to the recipient's iOS devices for one notification event.
+    Called fire-and-forget by the actor's client right after it writes the
+    in-app notification doc. Enforces the recipient's per-group preference.
+    """
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    data = request.get_json(silent=True) or {}
+    recipient_id = data.get("recipientId")
+    ntype = data.get("type")
+    # The actor is ALWAYS the authenticated caller. Trusting a client-supplied
+    # actorId would let any authenticated user spoof a push as someone else
+    # (e.g. "<other user> liked your photo"). A mismatch is a spoof attempt.
+    actor_id = data.get("actorId")
+    if actor_id is not None and actor_id != uid:
+        return jsonify({"error": "Forbidden: actor must be the authenticated user"}), 403
+    actor_id = uid
+    if not recipient_id or not ntype:
+        return jsonify({"error": "recipientId and type are required"}), 400
+    if recipient_id == actor_id:
+        return jsonify({"sent": 0, "skipped": "self"})
+
+    # Preference gate.
+    recipient_snap = firestore_db.collection("users").document(recipient_id).get()
+    recipient = recipient_snap.to_dict() if recipient_snap.exists else {}
+    if not pref_allows(recipient.get("notificationPrefs", {}) or {}, ntype):
+        return jsonify({"sent": 0, "skipped": "pref_off"})
+
+    # Tokens.
+    tokens_ref = firestore_db.collection("users").document(recipient_id).collection("pushTokens")
+    token_docs = list(tokens_ref.stream())
+    if not token_docs:
+        return jsonify({"sent": 0})
+
+    # Actor display name.
+    actor_name = "Someone"
+    if actor_id:
+        actor_snap = firestore_db.collection("users").document(actor_id).get()
+        if actor_snap.exists:
+            actor_name = actor_snap.to_dict().get("username") or actor_name
+
+    body = _push_copy(ntype, actor_name)
+    payload = {k: str(v) for k, v in {
+        "type": ntype,
+        "actorId": actor_id,
+        "postId": data.get("postId"),
+        "threadId": data.get("threadId"),
+        "commentId": data.get("commentId"),
+    }.items() if v is not None}
+
+    messages = [
+        messaging.Message(
+            token=d.id,
+            notification=messaging.Notification(title="Glass", body=body),
+            data=payload,
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(aps=messaging.Aps(sound="default")),
+            ),
+        )
+        for d in token_docs
+    ]
+
+    resp = messaging.send_each(messages)
+
+    pruned = 0
+    for i, r in enumerate(resp.responses):
+        if not r.success:
+            exc = r.exception
+            # Unregistered / invalid token -> remove it.
+            if isinstance(exc, (messaging.UnregisteredError, ValueError)) or "not a valid FCM" in str(exc):
+                token_docs[i].reference.delete()
+                pruned += 1
+
+    return jsonify({"sent": resp.success_count, "pruned": pruned})
+
+
 @app.route("/studio-items", methods=["GET"])
 def list_studio_items():
     """
@@ -2817,6 +2950,13 @@ def transfer_post():
     from_user_id = data["fromUserId"]
     to_user_id = data["toUserId"]
     token_id = int(data["tokenId"])
+    to_user_email = data.get("toUserEmail")
+
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if uid != from_user_id:
+        return jsonify({"error": "Forbidden"}), 403
 
     try:
         from_hash = compute_user_id_hash(from_user_id)
@@ -2824,6 +2964,11 @@ def transfer_post():
 
         transfer_fn = contract.functions.transferVirtual(from_hash, to_hash, token_id)
         tx_hash, receipt = send_contract_transaction(transfer_fn, 200000)
+
+        if firestore_db:
+            firestore_db.collection("posts").document(str(token_id)).set(
+                {"userId": to_user_id, "userEmail": to_user_email or ""}, merge=True
+            )
 
         return jsonify(
             {
@@ -2940,6 +3085,11 @@ def create_account():
 
         response_data["tokensGranted"] = 10000
         response_data["transaction_hash"] = tx_hash.hex()
+
+        if firestore_db:
+            balance_ref = firestore_db.collection("tokenBalances").document(user_id)
+            if not balance_ref.get().exists:
+                balance_ref.set({"balance": 10000, "lastOnChainBalance": 10000})
 
         return jsonify(response_data)
     except Exception as e:
@@ -3428,6 +3578,12 @@ def withdraw_tokens():
     stable_amount = float(data["amount"])
     to_address = data.get("toAddress")
 
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if uid != user_id:
+        return jsonify({"error": "Forbidden"}), 403
+
     if stable_amount <= 0:
         return jsonify({"error": "Amount must be positive"}), 400
 
@@ -3526,6 +3682,21 @@ def withdraw_tokens():
 
         # 10. Record withdrawal in Firestore
         record_withdrawal(user_id, net_usd, glas_amount, stable_amount)
+
+        if firestore_db:
+            balance_ref = firestore_db.collection("tokenBalances").document(user_id)
+            bal_snap = balance_ref.get()
+            if bal_snap.exists:
+                bal = bal_snap.to_dict()
+                balance_ref.set(
+                    {
+                        "balance": bal.get("balance", 0) - stable_amount,
+                        "lastOnChainBalance": max(
+                            0, bal.get("lastOnChainBalance", 0) - stable_amount
+                        ),
+                    },
+                    merge=True,
+                )
 
         response = {
             "success": True,
@@ -3683,6 +3854,12 @@ def toggle_privacy():
     user_id = data["userId"]
     is_private = data["isPrivate"]
 
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if uid != user_id:
+        return jsonify({"error": "Forbidden"}), 403
+
     try:
         # Read all user's posts from Firestore
         posts_ref = firestore_db.collection("posts")
@@ -3749,6 +3926,36 @@ def toggle_privacy():
                     "mediaType": media_type,
                 }
             )
+
+        for r in results:
+            old_id = str(r["oldTokenId"])
+            new_id = str(r["newTokenId"])
+            old_ref = firestore_db.collection("posts").document(old_id)
+            old_snap = old_ref.get()
+            if not old_snap.exists:
+                continue
+            old_data = old_snap.to_dict()
+            new_ref = firestore_db.collection("posts").document(new_id)
+            # copy likes + comments (top-level docs only, matching the client)
+            for like in old_ref.collection("likes").stream():
+                new_ref.collection("likes").document(like.id).set(like.to_dict())
+            for c in old_ref.collection("comments").stream():
+                new_ref.collection("comments").document(c.id).set(c.to_dict())
+            new_ref.set(
+                {
+                    **old_data,
+                    "tokenId": r["newTokenId"],
+                    "ipfsUrl": r.get("ipfsUri"),
+                    "hqMediaUrl": r.get("hqMediaUrl") or old_data.get("hqMediaUrl", ""),
+                    "isPrivate": is_private,
+                    "mediaType": r.get("mediaType") or old_data.get("mediaType", "photo"),
+                }
+            )
+            for like in old_ref.collection("likes").stream():
+                like.reference.delete()
+            for c in old_ref.collection("comments").stream():
+                c.reference.delete()
+            old_ref.delete()
 
         return jsonify(
             {
@@ -4583,6 +4790,146 @@ def verify_payment():
         traceback.print_exc()
         print(f"Verify payment error: {e}", flush=True)
         return jsonify({"error": f"Failed to verify payment: {e}"}), 500
+
+
+def _sync_creator_balance_async(creator_id, creator_balance, creator_last_on_chain):
+    """Best-effort background on-chain reconcile once creator earnings cross the
+    threshold (mirrors the client's old non-blocking post-commit sync)."""
+    def run():
+        try:
+            delta = creator_balance - creator_last_on_chain
+            if delta < SYNC_THRESHOLD or not token_contract:
+                return
+            creator_hash = compute_user_id_hash(creator_id)
+            # Same amount->wei conversion and mintToVirtual call as /sync-token-balance:
+            amount_wei = w3.to_wei(delta, "ether")
+            send_contract_transaction(
+                token_contract.functions.mintToVirtual(creator_hash, amount_wei), 300000
+            )
+            firestore_db.collection("tokenBalances").document(creator_id).set(
+                {"lastOnChainBalance": creator_balance}, merge=True
+            )
+        except Exception as e:
+            print(f"[economy sync] non-fatal for {creator_id}: {e}")
+    threading.Thread(target=run, daemon=True).start()
+
+
+@app.route("/collect-post", methods=["POST"])
+def collect_post():
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    data = request.get_json(silent=True) or {}
+    token_id = data.get("tokenId")
+    collector_id = data.get("collectorId")
+    creator_id = data.get("creatorId")
+    if token_id is None or not collector_id or not creator_id:
+        return jsonify({"error": "tokenId, collectorId, creatorId are required"}), 400
+    if uid != collector_id:
+        return jsonify({"error": "Forbidden: caller must be the collector"}), 403
+
+    token_id_str = str(token_id)
+    collection_ref = firestore_db.collection("collections").document(f"{token_id_str}_{collector_id}")
+    post_ref = firestore_db.collection("posts").document(token_id_str)
+    collector_ref = firestore_db.collection("tokenBalances").document(collector_id)
+    creator_ref = firestore_db.collection("tokenBalances").document(creator_id)
+    platform_ref = firestore_db.collection("tokenBalances").document("PLATFORM")
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    @fb_firestore.transactional
+    def run(txn):
+        if collection_ref.get(transaction=txn).exists:
+            return {"status": "dup"}
+        post_snap = post_ref.get(transaction=txn)
+        post_data = post_snap.to_dict() if post_snap.exists else {}
+        if post_data.get("collectEnabled") is False:
+            return {"status": "disabled"}
+        raw_price = post_data.get("collectPrice")
+        price = raw_price if isinstance(raw_price, (int, float)) else DEFAULT_COLLECT_PRICE
+        p, creator_earns, platform_cut = collect_split(price)
+
+        collector_snap = collector_ref.get(transaction=txn)
+        collector_balance = collector_snap.to_dict().get("balance", 0) if collector_snap.exists else 0
+        if collector_balance < p:
+            return {"status": "insufficient"}
+
+        creator_snap = creator_ref.get(transaction=txn)
+        creator_data = creator_snap.to_dict() if creator_snap.exists else {"balance": 0, "lastOnChainBalance": 0}
+        platform_snap = platform_ref.get(transaction=txn)
+        platform_data = platform_snap.to_dict() if platform_snap.exists else {"balance": 0, "lastOnChainBalance": 0}
+
+        new_creator = creator_data.get("balance", 0) + creator_earns
+        new_platform = platform_data.get("balance", 0) + platform_cut
+
+        txn.set(collector_ref, {"balance": collector_balance - p}, merge=True)
+        txn.set(creator_ref, {"balance": new_creator, "lastOnChainBalance": creator_data.get("lastOnChainBalance", 0)}, merge=True)
+        txn.set(platform_ref, {"balance": new_platform, "lastOnChainBalance": platform_data.get("lastOnChainBalance", 0)}, merge=True)
+        txn.set(collection_ref, {"tokenId": token_id, "collectorId": collector_id, "creatorId": creator_id, "createdAt": now_ms})
+        txn.set(post_ref, {"collectsCount": FirestoreIncrement(1)}, merge=True)
+        return {"status": "ok", "creatorBalance": new_creator, "creatorLastOnChain": creator_data.get("lastOnChainBalance", 0)}
+
+    result = run(firestore_db.transaction())
+    status = result["status"]
+    if status == "dup":
+        return jsonify({"collected": False})
+    if status == "disabled":
+        return jsonify({"error": "Collecting is turned off for this post"}), 400
+    if status == "insufficient":
+        return jsonify({"error": "Insufficient token balance"}), 400
+    _sync_creator_balance_async(creator_id, result["creatorBalance"], result["creatorLastOnChain"])
+    return jsonify({"collected": True})
+
+
+@app.route("/charge-view", methods=["POST"])
+def charge_view():
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    data = request.get_json(silent=True) or {}
+    viewer_id = data.get("viewerId")
+    creator_id = data.get("creatorId")
+    if not viewer_id or not creator_id:
+        return jsonify({"error": "viewerId and creatorId are required"}), 400
+    if uid != viewer_id:
+        return jsonify({"error": "Forbidden: caller must be the viewer"}), 403
+
+    VIEW_PRICE = 1
+    VIEW_EARNING = 0.5
+    viewer_ref = firestore_db.collection("tokenBalances").document(viewer_id)
+    creator_ref = firestore_db.collection("tokenBalances").document(creator_id)
+    platform_ref = firestore_db.collection("tokenBalances").document("PLATFORM")
+
+    @fb_firestore.transactional
+    def run(txn):
+        viewer_snap = viewer_ref.get(transaction=txn)
+        viewer_balance = viewer_snap.to_dict().get("balance", 0) if viewer_snap.exists else 0
+        if viewer_balance < VIEW_PRICE:
+            return {"status": "insufficient"}
+        creator_snap = creator_ref.get(transaction=txn)
+        creator_data = creator_snap.to_dict() if creator_snap.exists else {"balance": 0, "lastOnChainBalance": 0}
+        platform_snap = platform_ref.get(transaction=txn)
+        platform_data = platform_snap.to_dict() if platform_snap.exists else {"balance": 0, "lastOnChainBalance": 0}
+
+        new_viewer = viewer_balance - VIEW_PRICE
+        new_creator = creator_data.get("balance", 0) + VIEW_EARNING
+        new_platform = platform_data.get("balance", 0) + (VIEW_PRICE - VIEW_EARNING)
+
+        txn.set(viewer_ref, {"balance": new_viewer}, merge=True)
+        txn.set(creator_ref, {"balance": new_creator, "lastOnChainBalance": creator_data.get("lastOnChainBalance", 0)}, merge=True)
+        txn.set(platform_ref, {"balance": new_platform, "lastOnChainBalance": platform_data.get("lastOnChainBalance", 0)}, merge=True)
+        return {"status": "ok", "viewerBalance": new_viewer, "creatorBalance": new_creator, "creatorLastOnChain": creator_data.get("lastOnChainBalance", 0)}
+
+    result = run(firestore_db.transaction())
+    if result["status"] == "insufficient":
+        return jsonify({"error": "Insufficient token balance"}), 400
+    _sync_creator_balance_async(creator_id, result["creatorBalance"], result["creatorLastOnChain"])
+    return jsonify({"viewerBalance": result["viewerBalance"], "creatorBalance": result["creatorBalance"]})
 
 
 if __name__ == "__main__":
