@@ -2504,6 +2504,47 @@ def story_upload():
     })
 
 
+@app.route("/avatar-upload", methods=["POST"])
+def avatar_upload():
+    """
+    Upload a cropped profile image (avatar or cover) to GCS -- the same bucket
+    as all other media. Replaces the old client Firebase Storage path.
+    Body: { image: <base64>, shape: "circle"|"cover" }. Returns { mediaPath }.
+    """
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not gcs_bucket:
+        return jsonify({"error": "Storage not configured"}), 500
+
+    data = request.get_json(silent=True) or {}
+    base64_media = data.get("image")
+    shape = data.get("shape", "circle")
+    if not base64_media:
+        return jsonify({"error": "Missing image"}), 400
+    if shape not in ("circle", "cover"):
+        return jsonify({"error": "Invalid shape"}), 400
+
+    try:
+        hq_base64 = compress_image(base64_media, target_width=1080)
+        hq_bytes = base64.b64decode(hq_base64)
+    except Exception as e:
+        print(f"Avatar compression failed, using original: {e}")
+        hq_bytes = base64.b64decode(base64_media)
+
+    try:
+        ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+        blob_path = f"avatars/{uid}/{shape}-{ts}.jpg"
+        blob = gcs_bucket.blob(blob_path)
+        blob.upload_from_string(hq_bytes, content_type="image/jpeg")
+        media_path = f"/media/{blob_path}"
+    except Exception as e:
+        print(f"Avatar GCS upload failed: {e}")
+        return jsonify({"error": f"Error uploading avatar: {e}"}), 500
+
+    return jsonify({"mediaPath": media_path})
+
+
 def story_blob_path(media_path: str) -> str:
     """GCS blob path for a story's media, from its stored mediaPath."""
     return media_path.replace("/media/", "", 1)
