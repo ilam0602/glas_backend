@@ -239,6 +239,7 @@ CORS(app, origins=[
 # ============================================================
 # GLAS Withdrawal Constants
 # ============================================================
+DEFAULT_COLLECT_PRICE = 5  # default price (VW) to collect a post
 STABLE_TOKEN_USD_RATE = 1000  # 1000 stable tokens = $1
 WITHDRAWAL_FEE_PERCENT = 0.05  # 5% fee
 DAILY_WITHDRAWAL_CAP_USD = 50.0  # $50/day per user
@@ -1522,7 +1523,24 @@ def _user_email(user_id: str) -> str:
         return ""
 
 
-def save_post_server(token_id, response_data, user_id, is_private, caption, circle_slug):
+def _normalize_collect_price(value):
+    """Whole VW, at least 1 (the flat 0.5 platform cut must always fit)."""
+    try:
+        return max(1, int(round(float(value))))
+    except (TypeError, ValueError):
+        return DEFAULT_COLLECT_PRICE
+
+
+def save_post_server(
+    token_id,
+    response_data,
+    user_id,
+    is_private,
+    caption,
+    circle_slug,
+    collect_enabled=True,
+    collect_price=None,
+):
     """Server-side equivalent of the client savePost — writes /posts/{token_id}
     with the same schema, so the async flow doesn't depend on the client staying
     alive to create the post."""
@@ -1541,6 +1559,10 @@ def save_post_server(token_id, response_data, user_id, is_private, caption, circ
         "commentsCount": 0,
         "mediaType": response_data.get("mediaType", "photo"),
         "isPrivate": bool(is_private),
+        "collectEnabled": bool(collect_enabled),
+        "collectPrice": _normalize_collect_price(
+            collect_price if collect_price is not None else DEFAULT_COLLECT_PRICE
+        ),
         "rankScore": 0.354,
         "flagged": bool(response_data.get("flagged")),
     }
@@ -1772,6 +1794,8 @@ def mint_async():
     is_private = data.get("isPrivate", False)
     caption = (data.get("caption") or "").strip() or None
     circle_slug = data.get("circleSlug") or None
+    collect_enabled = bool(data.get("collectEnabled", True))
+    collect_price = _normalize_collect_price(data.get("collectPrice", DEFAULT_COLLECT_PRICE))
 
     try:
         items_in, is_carousel = _normalize_mint_items(data)
@@ -1812,6 +1836,8 @@ def mint_async():
                     "isPrivate": bool(is_private),
                     "caption": caption,
                     "circleSlug": circle_slug,
+                    "collectEnabled": collect_enabled,
+                    "collectPrice": collect_price,
                     "createdAt": SERVER_TIMESTAMP,
                 }
             )
@@ -1826,7 +1852,8 @@ def mint_async():
             return jsonify({"error": str(e)}), 500
         token_id = response_data["token_id"]
         save_post_server(
-            token_id, response_data, user_id, is_private, caption, circle_slug
+            token_id, response_data, user_id, is_private, caption, circle_slug,
+            collect_enabled, collect_price
         )
         _credit_post(user_id, response_data)
         job_ref.update(
@@ -1846,6 +1873,8 @@ def mint_async():
                 "isPrivate": bool(is_private),
                 "caption": caption,
                 "circleSlug": circle_slug,
+                "collectEnabled": collect_enabled,
+                "collectPrice": collect_price,
                 "isCarousel": is_carousel,
                 "itemCount": len(items_in),
                 "itemTypes": [it["mediaType"] for it in items_in],
@@ -1912,6 +1941,8 @@ def mint_process():
     is_private = job.get("isPrivate", False)
     caption = job.get("caption")
     circle_slug = job.get("circleSlug")
+    collect_enabled = job.get("collectEnabled", True)
+    collect_price = job.get("collectPrice", DEFAULT_COLLECT_PRICE)
     is_carousel = job.get("isCarousel", False)
     item_count = job.get("itemCount", 1)
     item_types = job.get("itemTypes", ["photo"])
@@ -1927,7 +1958,8 @@ def mint_process():
         )
         token_id = response_data["token_id"]
         save_post_server(
-            token_id, response_data, user_id, is_private, caption, circle_slug
+            token_id, response_data, user_id, is_private, caption, circle_slug,
+            collect_enabled, collect_price
         )
         _credit_post(user_id, response_data)
         job_ref.update(
