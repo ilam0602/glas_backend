@@ -280,6 +280,11 @@ def collect_split(price):
 COMMENT_WEIGHT = 3.0
 GRAVITY = 1.5
 INITIAL_RANK_SCORE = 0.354  # 1 / 2^1.5
+# Related-feed candidate pool: how many top-ranked posts we scan when building
+# a post's "related" list. Related-by-tag posts are surfaced from within this
+# pool, so it also bounds how deep the related feed can page. Fine for the
+# current dataset; revisit (composite index + rankScore cursor) as posts grow.
+RELATED_POOL_SIZE = 300
 
 
 def compute_rank_score(likes_count, comments_count, created_at_seconds):
@@ -2817,13 +2822,32 @@ def push_notify():
         "commentId": data.get("commentId"),
     }.items() if v is not None}
 
+    # App-icon badge = recipient's unread notification count. The client writes
+    # every notification with readAt=null; markAllRead sets it to a Timestamp,
+    # so this count is exactly the unread ones. (The app clears the icon badge
+    # to 0 whenever it's opened.)
+    badge_count = None
+    try:
+        unread = (
+            firestore_db.collection("users")
+            .document(recipient_id)
+            .collection("notifications")
+            .where("readAt", "==", None)
+            .get()
+        )
+        badge_count = len(unread)
+    except Exception as e:
+        print(f"[push] unread-count failed recipient={recipient_id}: {e}")
+
     messages = [
         messaging.Message(
             token=d.id,
             notification=messaging.Notification(title="Glass", body=body),
             data=payload,
             apns=messaging.APNSConfig(
-                payload=messaging.APNSPayload(aps=messaging.Aps(sound="default")),
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(sound="default", badge=badge_count)
+                ),
             ),
         )
         for d in token_docs
@@ -4667,6 +4691,100 @@ def explore_feed():
     except Exception as e:
         print(f"Explore feed error: {e}")
         return jsonify({"error": f"Error fetching explore feed: {e}"}), 500
+
+
+@app.route("/related/<token_id>", methods=["GET"])
+def related_feed(token_id):
+    """
+    GET endpoint for a post's "related" feed.
+
+    Ordering (all public, non-flagged posts, by descending rankScore within
+    each group):
+      1. the anchor post itself (so the client always renders it at the top)
+      2. posts sharing >=1 AI tag with the anchor  (topical match)
+      3. everything else                            (algo-score fallback)
+
+    Matched + fallback posts are drawn from the top-`RELATED_POOL_SIZE` ranked
+    posts, then offset-paginated. The anchor is fetched by id directly, so it is
+    included even if private/flagged (the user already opened it).
+
+    Query params: limit (default 8), cursor (base64-encoded integer offset)
+    Returns { posts: [...], nextCursor: string|null }
+    """
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    limit = request.args.get("limit", 8, type=int)
+    cursor = request.args.get("cursor", None)
+
+    # Cursor is a base64-encoded offset into the ordered result list.
+    offset = 0
+    if cursor:
+        try:
+            offset = max(0, int(base64.b64decode(cursor).decode("utf-8")))
+        except Exception as e:
+            print(f"Invalid related cursor: {e}")
+            offset = 0
+
+    try:
+        # Anchor post (fetched by id, independent of the public filter).
+        anchor_snap = firestore_db.collection("posts").document(str(token_id)).get()
+        anchor = anchor_snap.to_dict() if anchor_snap.exists else None
+        anchor_tags = set(anchor.get("tags", []) or []) if anchor else set()
+
+        # Candidate pool: top-ranked public, non-flagged posts. Reuses the same
+        # composite index as /explore (no new index required).
+        pool_docs = list(
+            firestore_db.collection("posts")
+            .where("flagged", "==", False)
+            .where("isPrivate", "==", False)
+            .order_by("rankScore", direction="DESCENDING")
+            .limit(RELATED_POOL_SIZE)
+            .stream()
+        )
+
+        # Partition the pool into tag-matches and the rest, each preserving the
+        # rankScore order from the stream.
+        matched = []
+        others = []
+        for doc_snap in pool_docs:
+            if doc_snap.id == str(token_id):
+                continue  # anchor is prepended separately
+            data = doc_snap.to_dict()
+            post_tags = set(data.get("tags", []) or [])
+            if anchor_tags and (post_tags & anchor_tags):
+                matched.append(data)
+            else:
+                others.append(data)
+
+        ordered = matched + others
+        full = ([anchor] + ordered) if anchor is not None else ordered
+
+        page = full[offset : offset + limit]
+        has_next = len(full) > offset + limit
+
+        posts_result = []
+        for data in page:
+            post_out = {}
+            for k, v in data.items():
+                if hasattr(v, "timestamp"):
+                    post_out[k] = int(v.timestamp() * 1000)  # millis for JS
+                else:
+                    post_out[k] = v
+            posts_result.append(post_out)
+
+        next_cursor = None
+        if has_next:
+            next_offset = offset + limit
+            next_cursor = base64.b64encode(
+                str(next_offset).encode("utf-8")
+            ).decode("utf-8")
+
+        return jsonify({"posts": posts_result, "nextCursor": next_cursor})
+
+    except Exception as e:
+        print(f"Related feed error: {e}")
+        return jsonify({"error": f"Error fetching related feed: {e}"}), 500
 
 
 @app.route("/refresh-scores", methods=["POST"])
