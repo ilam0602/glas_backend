@@ -2774,6 +2774,7 @@ def push_notify():
     data = request.get_json(silent=True) or {}
     recipient_id = data.get("recipientId")
     ntype = data.get("type")
+    print(f"[push] notify recipient={recipient_id} type={ntype} actor={uid}")
     # The actor is ALWAYS the authenticated caller. Trusting a client-supplied
     # actorId would let any authenticated user spoof a push as someone else
     # (e.g. "<other user> liked your photo"). A mismatch is a spoof attempt.
@@ -2790,12 +2791,14 @@ def push_notify():
     recipient_snap = firestore_db.collection("users").document(recipient_id).get()
     recipient = recipient_snap.to_dict() if recipient_snap.exists else {}
     if not pref_allows(recipient.get("notificationPrefs", {}) or {}, ntype):
+        print(f"[push] skipped: pref_off recipient={recipient_id} type={ntype}")
         return jsonify({"sent": 0, "skipped": "pref_off"})
 
     # Tokens.
     tokens_ref = firestore_db.collection("users").document(recipient_id).collection("pushTokens")
     token_docs = list(tokens_ref.stream())
     if not token_docs:
+        print(f"[push] no tokens for recipient={recipient_id} — device never registered")
         return jsonify({"sent": 0})
 
     # Actor display name.
@@ -2832,11 +2835,23 @@ def push_notify():
     for i, r in enumerate(resp.responses):
         if not r.success:
             exc = r.exception
+            # Log the REAL reason a send failed. A ThirdPartyAuthError /
+            # APNS auth failure here almost always means the APNs Auth Key
+            # (.p8) is missing or misconfigured in the Firebase console for
+            # this project (Project Settings -> Cloud Messaging -> Apple).
+            print(
+                f"[push] send failed recipient={recipient_id} "
+                f"exc={type(exc).__name__}: {exc}"
+            )
             # Unregistered / invalid token -> remove it.
             if isinstance(exc, (messaging.UnregisteredError, ValueError)) or "not a valid FCM" in str(exc):
                 token_docs[i].reference.delete()
                 pruned += 1
 
+    print(
+        f"[push] done recipient={recipient_id} type={ntype} "
+        f"tokens={len(messages)} sent={resp.success_count} pruned={pruned}"
+    )
     return jsonify({"sent": resp.success_count, "pruned": pruned})
 
 
