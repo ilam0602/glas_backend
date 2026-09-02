@@ -14,6 +14,7 @@ import tempfile
 import shutil
 import uuid
 import threading
+import time
 from datetime import datetime, timezone
 import requests
 import stripe
@@ -40,9 +41,23 @@ CONTRACT_ADDRESS = os.getenv("CONTRACT_ADDRESS")
 TOKEN_CONTRACT_ADDRESS = os.getenv("TOKEN_CONTRACT_ADDRESS")
 GLAS_CONTRACT_ADDRESS = os.getenv("GLAS_CONTRACT_ADDRESS")
 
-# Pinata API keys (ensure these are present in your .env)
+# Pinata API keys — legacy IPFS pinning, used only as a fallback when Filebase
+# is not configured.
 PINATA_API_KEY = os.getenv("PINATA_API_KEY")
 PINATA_SECRET_API_KEY = os.getenv("PINATA_SECRET_API_KEY")
+
+# Filebase — primary IPFS pinning (IPFS-backed S3, cheaper + higher request
+# limits than Pinata). When all three are set, all new pins go to Filebase and
+# Pinata is bypassed. Content addressing means the ipfs:// CIDs are identical
+# regardless of provider, so tokenURIs stay standard and portable.
+FILEBASE_KEY = os.getenv("FILEBASE_KEY")
+FILEBASE_SECRET = os.getenv("FILEBASE_SECRET")
+FILEBASE_BUCKET = os.getenv("FILEBASE_BUCKET")
+FILEBASE_ENDPOINT = os.getenv("FILEBASE_ENDPOINT", "https://s3.filebase.com")
+FILEBASE_ENABLED = bool(FILEBASE_KEY and FILEBASE_SECRET and FILEBASE_BUCKET)
+# Gateway used to build https URLs inside ERC-721 metadata JSON (provider-neutral;
+# override with your Filebase dedicated gateway for faster marketplace previews).
+IPFS_GATEWAY = os.getenv("IPFS_GATEWAY", "https://ipfs.io/ipfs/")
 
 # Stripe for token purchases
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
@@ -172,14 +187,15 @@ def verify_firebase_token(req):
         return None
 
 
-if not (
-    RPC_URL
-    and PRIVATE_KEY
-    and CONTRACT_ADDRESS
-    and PINATA_API_KEY
-    and PINATA_SECRET_API_KEY
-):
+if not (RPC_URL and PRIVATE_KEY and CONTRACT_ADDRESS):
     raise Exception("Missing one or more required environment variables.")
+
+# Need at least one IPFS pinning provider configured.
+if not (FILEBASE_ENABLED or (PINATA_API_KEY and PINATA_SECRET_API_KEY)):
+    raise Exception(
+        "No IPFS pinning provider configured: set FILEBASE_KEY/FILEBASE_SECRET/"
+        "FILEBASE_BUCKET (preferred) or PINATA_API_KEY/PINATA_SECRET_API_KEY."
+    )
 
 # Connect to Sepolia node
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
@@ -1017,7 +1033,7 @@ def process_mint_media_item(base64_data, media_type):
         lq_base64 = base64_data
         hq_bytes = raw_bytes
 
-    ipfs_url = pin_file_to_pinata(lq_base64, media_type=media_type)
+    ipfs_url = pin_file_to_ipfs(lq_base64, media_type=media_type)
     print(
         f"{'Video' if media_type == 'video' else 'Image'} (720p) uploaded to IPFS: {ipfs_url}"
     )
@@ -1061,36 +1077,111 @@ def generate_video_thumbnail_bytes(video_bytes):
     return None
 
 
-def pin_file_to_pinata(base64_image_str, media_type="photo"):
+def _ipfs_to_gateway(ipfs_url):
+    """ipfs://<cid>[/path] -> https gateway URL, using the configured gateway."""
+    return ipfs_url.replace("ipfs://", IPFS_GATEWAY, 1)
+
+
+_filebase_client = None
+
+
+def _get_filebase_client():
+    """Lazily build the S3 client for Filebase (path-style addressing)."""
+    global _filebase_client
+    if _filebase_client is None:
+        import boto3
+        from botocore.config import Config
+
+        _filebase_client = boto3.client(
+            "s3",
+            endpoint_url=FILEBASE_ENDPOINT,
+            aws_access_key_id=FILEBASE_KEY,
+            aws_secret_access_key=FILEBASE_SECRET,
+            config=Config(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},
+                retries={"max_attempts": 3, "mode": "standard"},
+            ),
+        )
+    return _filebase_client
+
+
+def _filebase_put(key, data, content_type):
     """
-    Takes a base64-encoded file string, uploads it to Pinata, and returns an ipfs:// URI.
+    Upload bytes to the Filebase IPFS bucket and return the resulting IPFS CID.
+    Filebase surfaces the CID as object metadata (x-amz-meta-cid); boto3 exposes
+    it under head_object()['Metadata']['cid']. Retries with exponential backoff
+    so a transient throttle/network blip doesn't fail a mint.
     """
-    file_data = base64.b64decode(base64_image_str)
+    client = _get_filebase_client()
+    last_err = None
+    for attempt in range(4):
+        try:
+            client.put_object(
+                Bucket=FILEBASE_BUCKET, Key=key, Body=data, ContentType=content_type
+            )
+            head = client.head_object(Bucket=FILEBASE_BUCKET, Key=key)
+            cid = (head.get("Metadata") or {}).get("cid")
+            if not cid:
+                # Fall back to the raw response header if the parsed key is absent.
+                cid = (
+                    head.get("ResponseMetadata", {})
+                    .get("HTTPHeaders", {})
+                    .get("x-amz-meta-cid")
+                )
+            if not cid:
+                raise Exception("Filebase did not return a CID for the upload")
+            return cid
+        except Exception as e:
+            last_err = e
+            if attempt < 3:
+                time.sleep(2 ** attempt)  # 1s, 2s, 4s
+    raise Exception(f"Filebase upload failed after retries: {last_err}")
 
-    if media_type == "video":
-        filename = "nft_video.mp4"
-    else:
-        filename = "nft_image.png"
 
-    files = {"file": (filename, file_data)}
-
+def _pin_bytes_to_pinata(file_data, filename, content_type="application/octet-stream"):
+    """Legacy fallback: pin raw bytes to Pinata, returning the CID (no ipfs:// prefix)."""
     url = "https://api.pinata.cloud/pinning/pinFileToIPFS"
-
     headers = {
         "pinata_api_key": PINATA_API_KEY,
         "pinata_secret_api_key": PINATA_SECRET_API_KEY,
     }
+    last_err = None
+    for attempt in range(4):
+        response = requests.post(
+            url, files={"file": (filename, file_data, content_type)}, headers=headers
+        )
+        if response.status_code == 200:
+            return response.json()["IpfsHash"]
+        last_err = response.text
+        # Only bother retrying transient throttling/5xx.
+        if response.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+            time.sleep(2 ** attempt)
+            continue
+        break
+    raise Exception(f"Pinata upload error: {last_err}")
 
-    response = requests.post(url, files=files, headers=headers)
-    if response.status_code != 200:
-        raise Exception(f"Pinata upload error: {response.text}")
 
-    ipfs_hash = response.json()["IpfsHash"]
-    ipfs_url = f"ipfs://{ipfs_hash}"
-    return ipfs_url
+def pin_file_to_ipfs(base64_image_str, media_type="photo"):
+    """
+    Upload media to IPFS and return an ipfs:// URI. Uses Filebase when configured,
+    otherwise falls back to Pinata. The CID (and thus the ipfs:// URI) is the same
+    across providers because it is derived from the content itself.
+    """
+    file_data = base64.b64decode(base64_image_str)
+    is_video = media_type == "video"
+    filename = "nft_video.mp4" if is_video else "nft_image.png"
+    content_type = "video/mp4" if is_video else "image/png"
+
+    if FILEBASE_ENABLED:
+        ext = "mp4" if is_video else "png"
+        cid = _filebase_put(f"nft/{uuid.uuid4().hex}.{ext}", file_data, content_type)
+        return f"ipfs://{cid}"
+
+    return f"ipfs://{_pin_bytes_to_pinata(file_data, filename, content_type)}"
 
 
-def pin_metadata_to_pinata(
+def pin_metadata_to_ipfs(
     image_ipfs_url,
     token_name,
     description="Photo minted on AuthenSnap",
@@ -1098,8 +1189,8 @@ def pin_metadata_to_pinata(
     media_items=None,
 ):
     """
-    Creates an ERC-721 metadata JSON with the image/video URL and pins it to Pinata.
-    Returns the ipfs:// URI of the metadata JSON.
+    Build the ERC-721 metadata JSON and pin it to IPFS (Filebase when configured,
+    else Pinata). Returns the ipfs:// URI of the metadata JSON (the tokenURI).
 
     OpenSea (and other marketplaces) expect tokenURI to point to a JSON file like:
     {
@@ -1113,9 +1204,7 @@ def pin_metadata_to_pinata(
     item; "image" (and "animation_url" for a leading video) still point at the
     first item so OpenSea previews keep working.
     """
-    gateway_url = image_ipfs_url.replace(
-        "ipfs://", "https://gateway.pinata.cloud/ipfs/"
-    )
+    gateway_url = _ipfs_to_gateway(image_ipfs_url)
     metadata = {
         "name": token_name,
         "description": description,
@@ -1129,27 +1218,37 @@ def pin_metadata_to_pinata(
     if media_items:
         metadata["media"] = [
             {
-                "uri": item_ipfs.replace(
-                    "ipfs://", "https://gateway.pinata.cloud/ipfs/"
-                ),
+                "uri": _ipfs_to_gateway(item_ipfs),
                 "media_type": item_type,
             }
             for (item_ipfs, item_type) in media_items
         ]
 
+    if FILEBASE_ENABLED:
+        body = json.dumps(metadata).encode("utf-8")
+        cid = _filebase_put(
+            f"nft/metadata/{uuid.uuid4().hex}.json", body, "application/json"
+        )
+        return f"ipfs://{cid}"
+
+    # Pinata fallback: pinJSONToIPFS.
     url = "https://api.pinata.cloud/pinning/pinJSONToIPFS"
     headers = {
         "pinata_api_key": PINATA_API_KEY,
         "pinata_secret_api_key": PINATA_SECRET_API_KEY,
         "Content-Type": "application/json",
     }
-
-    response = requests.post(url, json=metadata, headers=headers)
-    if response.status_code != 200:
-        raise Exception(f"Pinata metadata upload error: {response.text}")
-
-    ipfs_hash = response.json()["IpfsHash"]
-    return f"ipfs://{ipfs_hash}"
+    last_err = None
+    for attempt in range(4):
+        response = requests.post(url, json=metadata, headers=headers)
+        if response.status_code == 200:
+            return f"ipfs://{response.json()['IpfsHash']}"
+        last_err = response.text
+        if response.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+            time.sleep(2 ** attempt)
+            continue
+        break
+    raise Exception(f"Pinata metadata upload error: {last_err}")
 
 
 def resolve_image_from_token_uri(token_uri):
@@ -1413,7 +1512,7 @@ def run_mint_pipeline(items_in, user_id, wallet_address, is_private, is_carousel
     # 2. Create + pin ERC-721 metadata JSON
     try:
         token_name = "AuthenSnap Video" if media_type == "video" else "AuthenSnap Photo"
-        metadata_ipfs_url = pin_metadata_to_pinata(
+        metadata_ipfs_url = pin_metadata_to_ipfs(
             primary["ipfs_url"],
             token_name,
             media_type=media_type,
@@ -2392,10 +2491,10 @@ def mint_story_nft_background(story_id, user_id, media_b64, media_type):
             print(f"Story mint {story_id}: isPrivate read failed, defaulting to public: {e}")
 
         # 2. Pin the already-compressed media, then the metadata JSON.
-        #    pin_metadata_to_pinata sets image = gateway URL, and for video
+        #    pin_metadata_to_ipfs sets image = gateway URL, and for video
         #    also animation_url + media_type (server.py:876).
-        image_ipfs_url = pin_file_to_pinata(media_b64, media_type=media_type)
-        metadata_ipfs_url = pin_metadata_to_pinata(
+        image_ipfs_url = pin_file_to_ipfs(media_b64, media_type=media_type)
+        metadata_ipfs_url = pin_metadata_to_ipfs(
             image_ipfs_url,
             "AuthenSnap Story",
             description="Story minted on AuthenSnap",
@@ -3771,22 +3870,16 @@ def extract_virtual_burn_token_id(receipt, contract):
         raise Exception("No VirtualBurn event found in receipt")
 
 
-def pin_file_bytes_to_pinata(file_bytes, filename="stitched.mp4"):
+def pin_file_bytes_to_ipfs(file_bytes, filename="stitched.mp4", content_type="video/mp4"):
     """
-    Upload raw file bytes to Pinata (no base64 encoding).
-    Returns an ipfs:// URI.
+    Upload raw file bytes (no base64) to IPFS and return an ipfs:// URI.
+    Uses Filebase when configured, else Pinata. Used by the video-stitch flow.
     """
-    files = {"file": (filename, file_bytes)}
-    url = "https://api.pinata.cloud/pinning/pinFileToIPFS"
-    headers = {
-        "pinata_api_key": PINATA_API_KEY,
-        "pinata_secret_api_key": PINATA_SECRET_API_KEY,
-    }
-    response = requests.post(url, files=files, headers=headers)
-    if response.status_code != 200:
-        raise Exception(f"Pinata upload error: {response.text}")
-    ipfs_hash = response.json()["IpfsHash"]
-    return f"ipfs://{ipfs_hash}"
+    if FILEBASE_ENABLED:
+        ext = filename.rsplit(".", 1)[-1] if "." in filename else "bin"
+        cid = _filebase_put(f"nft/{uuid.uuid4().hex}.{ext}", file_bytes, content_type)
+        return f"ipfs://{cid}"
+    return f"ipfs://{_pin_bytes_to_pinata(file_bytes, filename, content_type)}"
 
 
 @app.route("/burn", methods=["POST"])
@@ -3844,7 +3937,7 @@ def remint_post():
     try:
         # Create new ERC-721 metadata JSON and pin to Pinata
         token_name = "AuthenSnap Photo"
-        metadata_ipfs_url = pin_metadata_to_pinata(ipfs_url, token_name)
+        metadata_ipfs_url = pin_metadata_to_ipfs(ipfs_url, token_name)
         print(f"Remint metadata uploaded to IPFS: {metadata_ipfs_url}")
 
         # Mint new token on-chain
@@ -3940,7 +4033,7 @@ def toggle_privacy():
             media_type = post_data.get("mediaType", "photo")
             if media_type == "video":
                 token_name = "AuthenSnap Video"
-            metadata_ipfs_url = pin_metadata_to_pinata(
+            metadata_ipfs_url = pin_metadata_to_ipfs(
                 raw_ipfs_url, token_name, media_type=media_type
             )
 
@@ -4409,10 +4502,10 @@ def stitch_videos():
             hq_bytes = stitched_bytes
 
         # Mint flow: pin 720p to IPFS → create metadata → mint on-chain
-        video_ipfs_url = pin_file_bytes_to_pinata(lq_bytes, "stitched.mp4")
+        video_ipfs_url = pin_file_bytes_to_ipfs(lq_bytes, "stitched.mp4")
         print(f"Stitched video (720p) uploaded to IPFS: {video_ipfs_url}")
 
-        metadata_ipfs_url = pin_metadata_to_pinata(
+        metadata_ipfs_url = pin_metadata_to_ipfs(
             video_ipfs_url, "AuthenSnap Video", media_type="video"
         )
         print(f"Metadata uploaded to IPFS: {metadata_ipfs_url}")
