@@ -2327,6 +2327,224 @@ def _get_admin_emails():
     return {e.strip().lower() for e in raw.split(",") if e.strip()}
 
 
+@app.route("/admin/stats", methods=["GET"])
+def admin_stats():
+    """
+    Aggregate platform stats for the admin dashboard. Admin-only (same
+    MODERATION_ADMIN_EMAILS gate as /admin/unlock-post). Returns totals for
+    posts, users, and engagement, plus a combined interactions total.
+    Uses Firestore count() aggregations (O(1), not full reads).
+    """
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    # Verify the caller is an authenticated admin.
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing bearer token"}), 401
+    try:
+        decoded = firebase_auth.verify_id_token(auth_header.split("Bearer ")[1])
+    except Exception:
+        return jsonify({"error": "Invalid or expired token"}), 401
+    admin_emails = _get_admin_emails()
+    caller_email = (decoded.get("email") or "").lower()
+    if not admin_emails:
+        return jsonify({"error": "Server has no MODERATION_ADMIN_EMAILS configured"}), 500
+    if caller_email not in admin_emails:
+        return jsonify({"error": "Not authorized"}), 403
+
+    def _count(query):
+        try:
+            return query.count().get()[0][0].value
+        except Exception as e:
+            print(f"[admin/stats] count failed: {e}")
+            return None
+
+    posts = _count(firestore_db.collection("posts"))
+    users = _count(firestore_db.collection("users"))
+    # collection_group("likes") counts post likes AND comment likes (both are
+    # subcollections named "likes") — acceptable as "all engagement" for now.
+    likes = _count(firestore_db.collection_group("likes"))
+    comments = _count(firestore_db.collection_group("comments"))
+    reactions = _count(firestore_db.collection_group("reactions"))
+    collects = _count(firestore_db.collection("collections"))
+    follows = _count(firestore_db.collection_group("following"))
+    stories = _count(firestore_db.collection("stories"))
+    story_views = _count(firestore_db.collection_group("views"))
+    dm_threads = _count(firestore_db.collection("dmThreads"))
+    messages = _count(firestore_db.collection_group("messages"))
+
+    total_interactions = sum(
+        v for v in (likes, comments, reactions, collects, follows) if isinstance(v, int)
+    )
+
+    # Daily active (proxy): distinct users who created a post or story in the
+    # last 24h. There is no per-user lastActive field yet, so this counts
+    # content creators only, not viewers/likers. Upgrade to true DAU by adding
+    # a lastActive timestamp on users/{uid} and counting it here.
+    daily_active = None
+    try:
+        from datetime import timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+        active_ids = set()
+        for coll in ("posts", "stories"):
+            for d in firestore_db.collection(coll).where("createdAt", ">=", cutoff).stream():
+                uid_v = d.to_dict().get("userId")
+                if uid_v:
+                    active_ids.add(uid_v)
+        daily_active = len(active_ids)
+    except Exception as e:
+        print(f"[admin/stats] dailyActive failed: {e}")
+
+    return jsonify({
+        "posts": posts,
+        "users": users,
+        "interactions": total_interactions,
+        "dailyActive": daily_active,
+        "stories": stories,
+        "storyViews": story_views,
+        "dmThreads": dm_threads,
+        "messages": messages,
+        "breakdown": {
+            "likes": likes,
+            "comments": comments,
+            "reactions": reactions,
+            "collects": collects,
+            "follows": follows,
+        },
+    })
+
+
+@app.route("/admin/top-performers", methods=["GET"])
+def admin_top_performers():
+    """
+    All-time top performers, ranked by interactions received. Admin-only.
+    - topPosts: posts ranked by (likes + comments + reactions + collects).
+    - topProfiles: users ranked by the sum of interactions across their posts.
+    Scans the full posts collection (using the denormalized counter fields),
+    so it's heavier than /admin/stats — call it on demand, not on a poll.
+    ?limit=N (default 10).
+    """
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing bearer token"}), 401
+    try:
+        decoded = firebase_auth.verify_id_token(auth_header.split("Bearer ")[1])
+    except Exception:
+        return jsonify({"error": "Invalid or expired token"}), 401
+    admin_emails = _get_admin_emails()
+    caller_email = (decoded.get("email") or "").lower()
+    if not admin_emails:
+        return jsonify({"error": "Server has no MODERATION_ADMIN_EMAILS configured"}), 500
+    if caller_email not in admin_emails:
+        return jsonify({"error": "Not authorized"}), 403
+
+    limit = request.args.get("limit", default=10, type=int)
+
+    def _post_interactions(data):
+        likes = data.get("likesCount", 0) or 0
+        comments = data.get("commentsCount", 0) or 0
+        collects = data.get("collectsCount", 0) or 0
+        rc = data.get("reactionCounts")
+        reactions = (
+            sum(v for v in rc.values() if isinstance(v, (int, float)))
+            if isinstance(rc, dict) else 0
+        )
+        return int(likes + comments + collects + reactions)
+
+    top_posts = []
+    profile_totals = {}  # userId -> {"interactions": n, "posts": n}
+    try:
+        for d in firestore_db.collection("posts").stream():
+            data = d.to_dict()
+            score = _post_interactions(data)
+            uid_v = data.get("userId")
+            top_posts.append({
+                "tokenId": data.get("tokenId"),
+                "userId": uid_v,
+                "userEmail": data.get("userEmail", ""),
+                "interactions": score,
+                "likes": data.get("likesCount", 0) or 0,
+                "comments": data.get("commentsCount", 0) or 0,
+            })
+            if uid_v:
+                t = profile_totals.setdefault(uid_v, {"interactions": 0, "posts": 0})
+                t["interactions"] += score
+                t["posts"] += 1
+    except Exception as e:
+        return jsonify({"error": f"Failed to scan posts: {e}"}), 500
+
+    top_posts.sort(key=lambda p: p["interactions"], reverse=True)
+    top_posts = top_posts[:limit]
+
+    top_profiles = [{"userId": uid_v, **vals} for uid_v, vals in profile_totals.items()]
+    top_profiles.sort(key=lambda p: p["interactions"], reverse=True)
+    top_profiles = top_profiles[:limit]
+
+    # Resolve display names for the top results only (<= limit lookups each).
+    name_cache = {}
+
+    def _username(uid_v):
+        if not uid_v:
+            return None
+        if uid_v in name_cache:
+            return name_cache[uid_v]
+        name = uid_v
+        try:
+            snap = firestore_db.collection("users").document(uid_v).get()
+            if snap.exists:
+                dd = snap.to_dict()
+                name = dd.get("username") or dd.get("email") or uid_v
+        except Exception:
+            pass
+        name_cache[uid_v] = name
+        return name
+
+    for p in top_posts:
+        p["username"] = _username(p.get("userId"))
+    for p in top_profiles:
+        p["username"] = _username(p.get("userId"))
+
+    # Top referral codes: rank referrers by how many users signed up via their
+    # code. On a user doc, `referredBy` stores the REFERRER's uid; the user's
+    # own code is `referralCode`. One pass over users groups + counts them.
+    referred_count = {}       # referrer_uid -> number of users they referred
+    referrer_info = {}        # uid -> {"username", "referralCode"}
+    try:
+        for d in firestore_db.collection("users").stream():
+            data = d.to_dict()
+            referrer_info[d.id] = {
+                "username": data.get("username") or data.get("email"),
+                "referralCode": data.get("referralCode"),
+            }
+            rb = data.get("referredBy")
+            if rb:
+                referred_count[rb] = referred_count.get(rb, 0) + 1
+    except Exception as e:
+        print(f"[admin/top-performers] referral scan failed: {e}")
+
+    top_referrers = [
+        {
+            "userId": ref_uid,
+            "username": referrer_info.get(ref_uid, {}).get("username") or ref_uid,
+            "referralCode": referrer_info.get(ref_uid, {}).get("referralCode"),
+            "referredUsers": count,
+        }
+        for ref_uid, count in referred_count.items()
+    ]
+    top_referrers.sort(key=lambda r: r["referredUsers"], reverse=True)
+    top_referrers = top_referrers[:limit]
+
+    return jsonify({
+        "topPosts": top_posts,
+        "topProfiles": top_profiles,
+        "topReferrers": top_referrers,
+    })
+
+
 @app.route("/admin/unlock-post", methods=["POST"])
 def admin_unlock_post():
     """
