@@ -251,6 +251,7 @@ CORS(app, origins=[
     "https://glassocial.com",
     "https://www.glassocial.com",
     "https://glas-verified-social-reality-486202920754.us-central1.run.app",
+    "https://glas-mod-client-486202920754.us-central1.run.app",
 ])
 
 # ============================================================
