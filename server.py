@@ -3061,7 +3061,7 @@ def push_notify():
     messages = [
         messaging.Message(
             token=d.id,
-            notification=messaging.Notification(title="Glass", body=body),
+            notification=messaging.Notification(title="Glas", body=body),
             data=payload,
             apns=messaging.APNSConfig(
                 payload=messaging.APNSPayload(
