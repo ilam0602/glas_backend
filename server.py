@@ -3694,6 +3694,63 @@ def referral_leaderboard():
         return jsonify({"error": f"Error fetching leaderboard: {e}"}), 500
 
 
+# Ledger reasons that earn leaderboard points, surfaced as quests on the client.
+POINT_SUMMARY_REASONS = (
+    "post_photo",
+    "post_video",
+    "referral_signup",
+    "referral_post_bonus",
+)
+
+
+@app.route("/points/summary", methods=["GET"])
+def points_summary():
+    """
+    Authenticated per-user breakdown of earned points, aggregated from the
+    pointTransactions ledger. Feeds the Quests screen's live counts (how many
+    of each earning action the caller has completed). `points` is the
+    authoritative running total from the user doc (the leaderboard value).
+
+    Returns { points, photoPosts, videoPosts, signups, friendPostDays,
+              pointsByReason: { <reason>: <summed delta> } }
+    """
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    try:
+        user_doc = firestore_db.collection("users").document(uid).get()
+        total_points = (
+            (user_doc.to_dict() or {}).get("points", 0) if user_doc.exists else 0
+        )
+
+        counts = {reason: 0 for reason in POINT_SUMMARY_REASONS}
+        points_by = {reason: 0 for reason in POINT_SUMMARY_REASONS}
+        ledger = firestore_db.collection("pointTransactions").where("userId", "==", uid)
+        for doc in ledger.stream():
+            data = doc.to_dict()
+            reason = data.get("reason")
+            if reason in counts:
+                counts[reason] += 1
+                points_by[reason] += data.get("delta", 0) or 0
+
+        return jsonify(
+            {
+                "points": total_points,
+                "photoPosts": counts["post_photo"],
+                "videoPosts": counts["post_video"],
+                "signups": counts["referral_signup"],
+                "friendPostDays": counts["referral_post_bonus"],
+                "pointsByReason": points_by,
+            }
+        )
+    except Exception as e:
+        print(f"[points/summary] error: {e}")
+        return jsonify({"error": f"Error fetching points summary: {e}"}), 500
+
+
 @app.route("/referral/code", methods=["POST"])
 def ensure_current_user_referral_code():
     """
