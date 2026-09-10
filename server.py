@@ -3044,6 +3044,46 @@ def _push_copy(ntype: str, actor_name: str) -> str:
     }.get(ntype, f"{actor_name} sent you a notification")
 
 
+def _unread_badge_count(user_id):
+    """The app-icon badge count, matching what the app shows in its Activity tray
+    (`useNotifications().unreadCount`): unread NON-DM notification docs + unread DM
+    threads. DM notification *docs* are excluded — the client drops them and derives
+    DM activity from the threads themselves, so counting the per-message dm docs would
+    over-count. Returns None on failure (leave the badge unchanged)."""
+    if not firestore_db:
+        return None
+    try:
+        notifs = (
+            firestore_db.collection("users")
+            .document(user_id)
+            .collection("notifications")
+            .where("readAt", "==", None)
+            .get()
+        )
+        notif_count = sum(1 for d in notifs if (d.to_dict() or {}).get("type") != "dm")
+
+        threads = (
+            firestore_db.collection("dmThreads")
+            .where("participantIds", "array_contains", user_id)
+            .get()
+        )
+        thread_count = 0
+        for t in threads:
+            td = t.to_dict() or {}
+            last_sender = td.get("lastSenderId")
+            if not last_sender or last_sender == user_id:
+                continue  # no messages, or the last one is the user's own
+            last_msg = td.get("lastMessageAt")
+            last_read = (td.get("lastReadAt") or {}).get(user_id)
+            if last_msg is not None and (last_read is None or last_read < last_msg):
+                thread_count += 1
+
+        return notif_count + thread_count
+    except Exception as e:
+        print(f"[push] badge-count failed user={user_id}: {e}")
+        return None
+
+
 @app.route("/push/notify", methods=["POST"])
 def push_notify():
     """
@@ -3103,22 +3143,9 @@ def push_notify():
         "commentId": data.get("commentId"),
     }.items() if v is not None}
 
-    # App-icon badge = recipient's unread notification count. The client writes
-    # every notification with readAt=null; markAllRead sets it to a Timestamp,
-    # so this count is exactly the unread ones. (The app clears the icon badge
-    # to 0 whenever it's opened.)
-    badge_count = None
-    try:
-        unread = (
-            firestore_db.collection("users")
-            .document(recipient_id)
-            .collection("notifications")
-            .where("readAt", "==", None)
-            .get()
-        )
-        badge_count = len(unread)
-    except Exception as e:
-        print(f"[push] unread-count failed recipient={recipient_id}: {e}")
+    # App-icon badge = the recipient's in-app Activity unread total (see
+    # _unread_badge_count) so the red number matches what the app shows.
+    badge_count = _unread_badge_count(recipient_id)
 
     messages = [
         messaging.Message(
@@ -3158,6 +3185,55 @@ def push_notify():
         f"tokens={len(messages)} sent={resp.success_count} pruned={pruned}"
     )
     return jsonify({"sent": resp.success_count, "pruned": pruned})
+
+
+@app.route("/push/sync-badge", methods=["POST"])
+def push_sync_badge():
+    """Silently set the CALLER's own app-icon badge to their current in-app unread total.
+    The server can't otherwise observe an in-app read, so the client calls this after it
+    marks notifications / DM threads read — keeping the red badge consistent with the
+    in-app count. Sends a content-available push with NO alert or sound to the caller's
+    own devices (they aren't notified of their own read; iOS just applies the badge)."""
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    badge_count = _unread_badge_count(uid)
+    if badge_count is None:
+        return jsonify({"sent": 0, "skipped": "count_failed"})
+
+    tokens_ref = firestore_db.collection("users").document(uid).collection("pushTokens")
+    token_docs = list(tokens_ref.stream())
+    if not token_docs:
+        return jsonify({"sent": 0, "badge": badge_count})
+
+    messages = [
+        messaging.Message(
+            token=d.id,
+            apns=messaging.APNSConfig(
+                # Silent, low-priority background push: content-available lets iOS apply
+                # the badge without showing an alert or playing a sound.
+                headers={"apns-priority": "5", "apns-push-type": "background"},
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(badge=badge_count, content_available=True)
+                ),
+            ),
+        )
+        for d in token_docs
+    ]
+    resp = messaging.send_each(messages)
+
+    pruned = 0
+    for i, r in enumerate(resp.responses):
+        if not r.success:
+            exc = r.exception
+            if isinstance(exc, (messaging.UnregisteredError, ValueError)) or "not a valid FCM" in str(exc):
+                token_docs[i].reference.delete()
+                pruned += 1
+    print(f"[push] sync-badge uid={uid} badge={badge_count} sent={resp.success_count} pruned={pruned}")
+    return jsonify({"sent": resp.success_count, "badge": badge_count, "pruned": pruned})
 
 
 @app.route("/studio-items", methods=["GET"])
