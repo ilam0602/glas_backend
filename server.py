@@ -45,6 +45,19 @@ GLAS_CONTRACT_ADDRESS = os.getenv("GLAS_CONTRACT_ADDRESS")
 # is not configured.
 PINATA_API_KEY = os.getenv("PINATA_API_KEY")
 PINATA_SECRET_API_KEY = os.getenv("PINATA_SECRET_API_KEY")
+PINATA_PIN_FILE_URL = "https://api.pinata.cloud/pinning/pinFileToIPFS"
+PINATA_PIN_JSON_URL = "https://api.pinata.cloud/pinning/pinJSONToIPFS"
+
+
+def _pinata_headers(content_json=False):
+    """Pinata auth headers (optionally with a JSON Content-Type)."""
+    headers = {
+        "pinata_api_key": PINATA_API_KEY,
+        "pinata_secret_api_key": PINATA_SECRET_API_KEY,
+    }
+    if content_json:
+        headers["Content-Type"] = "application/json"
+    return headers
 
 # Filebase — primary IPFS pinning (IPFS-backed S3, cheaper + higher request
 # limits than Pinata). When all three are set, all new pins go to Filebase and
@@ -1207,11 +1220,8 @@ def _filebase_put(key, data, content_type):
 
 def _pin_bytes_to_pinata(file_data, filename, content_type="application/octet-stream"):
     """Legacy fallback: pin raw bytes to Pinata, returning the CID (no ipfs:// prefix)."""
-    url = "https://api.pinata.cloud/pinning/pinFileToIPFS"
-    headers = {
-        "pinata_api_key": PINATA_API_KEY,
-        "pinata_secret_api_key": PINATA_SECRET_API_KEY,
-    }
+    url = PINATA_PIN_FILE_URL
+    headers = _pinata_headers()
     last_err = None
     for attempt in range(4):
         response = requests.post(
@@ -1298,12 +1308,8 @@ def pin_metadata_to_ipfs(
         return f"ipfs://{cid}"
 
     # Pinata fallback: pinJSONToIPFS.
-    url = "https://api.pinata.cloud/pinning/pinJSONToIPFS"
-    headers = {
-        "pinata_api_key": PINATA_API_KEY,
-        "pinata_secret_api_key": PINATA_SECRET_API_KEY,
-        "Content-Type": "application/json",
-    }
+    url = PINATA_PIN_JSON_URL
+    headers = _pinata_headers(content_json=True)
     last_err = None
     for attempt in range(4):
         response = requests.post(url, json=metadata, headers=headers)
@@ -1913,26 +1919,10 @@ def mint_nft():
     is_private = data.get("isPrivate", False)
 
     # Normalize both request shapes into an ordered list of {image, mediaType}.
-    is_carousel = "media" in data
-    if is_carousel:
-        media_param = data["media"]
-        if not isinstance(media_param, list) or not (1 <= len(media_param) <= 10):
-            return jsonify({"error": "media must be a list of 1-10 items"}), 400
-        items_in = []
-        for m in media_param:
-            if not isinstance(m, dict) or "image" not in m:
-                return (
-                    jsonify({"error": "Each media item needs an image field"}),
-                    400,
-                )
-            item_type = m.get("mediaType", "photo")
-            if item_type not in ("photo", "video"):
-                return jsonify({"error": f"Invalid mediaType: {item_type}"}), 400
-            items_in.append({"image": m["image"], "mediaType": item_type})
-    else:
-        items_in = [
-            {"image": data["image"], "mediaType": data.get("mediaType", "photo")}
-        ]
+    try:
+        items_in, is_carousel = _normalize_mint_items(data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
     if not user_id and not wallet_address:
         return (
