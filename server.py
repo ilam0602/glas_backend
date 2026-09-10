@@ -187,6 +187,22 @@ def verify_firebase_token(req):
         return None
 
 
+def _require_uid(claimed_uid):
+    """Bind a money/mint action to its authenticated caller. Returns a Flask error
+    response to return immediately, or None to proceed:
+      - 401 if the request has no valid Firebase bearer token,
+      - 403 if the verified uid isn't `claimed_uid` (the body's userId/fromUserId).
+    Use on any endpoint that acts on a user's tokens/posts so a caller can never
+    pass someone else's id. (Server-to-server workers authenticate differently and
+    don't use this.)"""
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if uid != claimed_uid:
+        return jsonify({"error": "Forbidden"}), 403
+    return None
+
+
 if not (RPC_URL and PRIVATE_KEY and CONTRACT_ADDRESS):
     raise Exception("Missing one or more required environment variables.")
 
@@ -392,9 +408,7 @@ def assign_referral_code(user_id: str) -> str:
         code_ref = firestore_db.collection("referralCodes").document(code)
         try:
             code_ref.create({"userId": user_id})
-            firestore_db.collection("users").document(user_id).set(
-                {"referralCode": code}, merge=True
-            )
+            _rewards_ref(user_id).set({"referralCode": code}, merge=True)
             return code
         except AlreadyExists:
             continue
@@ -409,11 +423,10 @@ def ensure_referral_code(user_id: str, user_data=None):
     Also repairs the referralCodes reverse lookup when possible. Returns
     (code, created), where created is True only when a new code was assigned.
     """
-    if user_data is None:
-        user_doc = firestore_db.collection("users").document(user_id).get()
-        user_data = user_doc.to_dict() if user_doc.exists else {}
-
-    existing_code = user_data.get("referralCode")
+    # referralCode now lives on the private rewards subdoc (with a legacy
+    # fallback inside _get_rewards). The user_data arg is kept for backward
+    # compatibility but is no longer the source for the code.
+    existing_code = _get_rewards(user_id).get("referralCode")
     if existing_code:
         code_ref = firestore_db.collection("referralCodes").document(existing_code)
         try:
@@ -427,6 +440,50 @@ def ensure_referral_code(user_id: str, user_data=None):
         return existing_code, False
 
     return assign_referral_code(user_id), True
+
+
+REWARDS_FIELDS = (
+    "points",
+    "referralCode",
+    "referredBy",
+    "phoneVerified",
+    "phoneVerifiedAt",
+)
+
+
+def _rewards_ref(user_id: str):
+    """Owner-only private rewards subdoc: users/{uid}/private/rewards.
+
+    The server (firebase-admin) is the ONLY writer. The client reads this
+    subdoc for the owner only. Holds the money-adjacent reward fields that
+    used to live on the public users/{uid} doc (see REWARDS_FIELDS).
+    """
+    return (
+        firestore_db.collection("users")
+        .document(user_id)
+        .collection("private")
+        .document("rewards")
+    )
+
+
+def _get_rewards(user_id: str) -> dict:
+    """Return the rewards subdoc dict for user_id.
+
+    Falls back to the legacy top-level fields on users/{uid} when the subdoc
+    doesn't exist yet, so un-migrated users keep working during the transition.
+    Returns {} if neither the subdoc nor a legacy user doc exists.
+    """
+    if not firestore_db:
+        return {}
+    snap = _rewards_ref(user_id).get()
+    if snap.exists:
+        return snap.to_dict() or {}
+    # Legacy fallback: the fields still live on the top-level user doc.
+    user_doc = firestore_db.collection("users").document(user_id).get()
+    if not user_doc.exists:
+        return {}
+    user_data = user_doc.to_dict() or {}
+    return {f: user_data[f] for f in REWARDS_FIELDS if f in user_data}
 
 
 def _award_points(
@@ -452,7 +509,7 @@ def _award_points(
         return False
 
     ledger_ref = firestore_db.collection("pointTransactions").document(dedup_id)
-    user_ref = firestore_db.collection("users").document(user_id)
+    rewards_ref = _rewards_ref(user_id)
     now = datetime.now(timezone.utc)
 
     @fb_firestore.transactional
@@ -470,7 +527,7 @@ def _award_points(
                 "createdAt": now,
             },
         )
-        txn.set(user_ref, {"points": FirestoreIncrement(delta)}, merge=True)
+        txn.set(rewards_ref, {"points": FirestoreIncrement(delta)}, merge=True)
         return True
 
     return _run(firestore_db.transaction())
@@ -524,9 +581,7 @@ def redeem_referral_code(code: str, new_user_id: str):
     # once EVER for this pair via the ledger. The deterministic refsignup id is
     # the once-only guard, so concurrent/retried /create-account calls can't
     # double-credit (the old batch had no such guard).
-    firestore_db.collection("users").document(new_user_id).set(
-        {"referredBy": referrer_id}, merge=True
-    )
+    _rewards_ref(new_user_id).set({"referredBy": referrer_id}, merge=True)
     _award_points(
         referrer_id,
         1,
@@ -567,11 +622,7 @@ def credit_referral_bonus(poster_id: str, points_type: str, token_id=None) -> bo
     at most once per UTC calendar day per (referrer, referee) pair. Idempotent +
     logged. Returns True if credited this call. points_type is 'picture'/'video'.
     """
-    poster_doc = firestore_db.collection("users").document(poster_id).get()
-    if not poster_doc.exists:
-        return False
-
-    referrer_id = poster_doc.to_dict().get("referredBy")
+    referrer_id = _get_rewards(poster_id).get("referredBy")
     if not referrer_id:
         return False
 
@@ -2517,11 +2568,13 @@ def admin_top_performers():
     try:
         for d in firestore_db.collection("users").stream():
             data = d.to_dict()
+            # referralCode / referredBy now live on the private rewards subdoc.
+            rewards = _get_rewards(d.id)
             referrer_info[d.id] = {
                 "username": data.get("username") or data.get("email"),
-                "referralCode": data.get("referralCode"),
+                "referralCode": rewards.get("referralCode"),
             }
-            rb = data.get("referredBy")
+            rb = rewards.get("referredBy")
             if rb:
                 referred_count[rb] = referred_count.get(rb, 0) + 1
     except Exception as e:
@@ -3302,6 +3355,9 @@ def export_token():
         return jsonify({"error": "Missing userId, tokenId, or toAddress"}), 400
 
     user_id = data["userId"]
+    err = _require_uid(user_id)
+    if err:
+        return err
     token_id = int(data["tokenId"])
     to_address = data["toAddress"]
 
@@ -3350,11 +3406,9 @@ def transfer_post():
     token_id = int(data["tokenId"])
     to_user_email = data.get("toUserEmail")
 
-    uid = verify_firebase_token(request)
-    if not uid:
-        return jsonify({"error": "Missing or invalid authorization token"}), 401
-    if uid != from_user_id:
-        return jsonify({"error": "Forbidden"}), 403
+    err = _require_uid(from_user_id)
+    if err:
+        return err
 
     try:
         from_hash = compute_user_id_hash(from_user_id)
@@ -3395,6 +3449,9 @@ def import_token():
         return jsonify({"error": "Missing userId or tokenId"}), 400
 
     user_id = data["userId"]
+    err = _require_uid(user_id)
+    if err:
+        return err
     token_id = int(data["tokenId"])
 
     try:
@@ -3459,9 +3516,11 @@ def create_account():
             own_code, _ = ensure_referral_code(user_id, user_data)
             response_data["referralCode"] = own_code
 
-            if "referredBy" in user_data:
+            # referredBy / phoneVerified now live on the private rewards subdoc.
+            rewards = _get_rewards(user_id)
+            if "referredBy" in rewards:
                 response_data["referralLinked"] = True
-            elif user_data.get("phoneVerified") is True:
+            elif rewards.get("phoneVerified") is True:
                 referrer_id = redeem_referral_code(submitted_referral_code, user_id)
                 response_data["referralLinked"] = referrer_id is not None
             else:
@@ -3533,7 +3592,7 @@ def phone_verify():
 
     phone_hash = hash_phone_number(e164, PHONE_HASH_SALT)
     phone_ref = firestore_db.collection("phoneNumbers").document(phone_hash)
-    user_ref = firestore_db.collection("users").document(account_uid)
+    rewards_ref = _rewards_ref(account_uid)
 
     transaction = firestore_db.transaction()
 
@@ -3546,7 +3605,7 @@ def phone_verify():
                 return False  # phone already registered to another account
         txn.set(phone_ref, {"uid": account_uid, "createdAt": SERVER_TIMESTAMP})
         txn.set(
-            user_ref,
+            rewards_ref,
             {"phoneVerified": True, "phoneVerifiedAt": SERVER_TIMESTAMP},
             merge=True,
         )
@@ -3660,31 +3719,39 @@ def referral_leaderboard():
     limit = min(request.args.get("limit", 50, type=int), 100)
 
     try:
+        # points now lives on users/{uid}/private/rewards, so rank via a
+        # collection-group query over the "private" subcollection. This needs
+        # a collection-group index on (private, points DESC).
         query = (
-            firestore_db.collection("users")
+            firestore_db.collection_group("private")
             .order_by("points", direction="DESCENDING")
             .limit(limit)
         )
         leaderboard = []
-        for rank, doc in enumerate(query.stream(), start=1):
-            data = doc.to_dict()
+        for rank, rewards_doc in enumerate(query.stream(), start=1):
+            rewards = rewards_doc.to_dict() or {}
+            # users/{uid}/private/rewards -> parent (private) -> parent (user doc)
+            user_ref = rewards_doc.reference.parent.parent
+            user_id = user_ref.id
+            user_snap = user_ref.get()
+            data = user_snap.to_dict() if user_snap.exists else {}
             email = data.get("email") or ""
             if not email:
                 post_query = (
                     firestore_db.collection("posts")
-                    .where("userId", "==", doc.id)
+                    .where("userId", "==", user_id)
                     .limit(1)
                 )
                 for post_doc in post_query.stream():
                     email = post_doc.to_dict().get("userEmail") or ""
                     break
-            display_name = email or data.get("displayName") or f"user_{doc.id[:6]}"
+            display_name = email or data.get("displayName") or f"user_{user_id[:6]}"
             leaderboard.append(
                 {
-                    "userId": doc.id,
+                    "userId": user_id,
                     "email": email,
                     "displayName": display_name,
-                    "points": data.get("points", 0),
+                    "points": rewards.get("points", 0),
                     "rank": rank,
                 }
             )
@@ -3721,10 +3788,7 @@ def points_summary():
         return jsonify({"error": "Firebase not configured on server"}), 500
 
     try:
-        user_doc = firestore_db.collection("users").document(uid).get()
-        total_points = (
-            (user_doc.to_dict() or {}).get("points", 0) if user_doc.exists else 0
-        )
+        total_points = _get_rewards(uid).get("points", 0)
 
         counts = {reason: 0 for reason in POINT_SUMMARY_REASONS}
         points_by = {reason: 0 for reason in POINT_SUMMARY_REASONS}
@@ -3770,16 +3834,15 @@ def ensure_current_user_referral_code():
         user_data = user_doc.to_dict() if user_doc.exists else {}
         code, created = ensure_referral_code(uid, user_data)
 
-        if "points" not in user_data:
-            firestore_db.collection("users").document(uid).set(
-                {"points": 0}, merge=True
-            )
+        rewards = _get_rewards(uid)
+        if "points" not in rewards:
+            _rewards_ref(uid).set({"points": 0}, merge=True)
 
         return jsonify(
             {
                 "success": True,
                 "referralCode": code,
-                "points": user_data.get("points", 0),
+                "points": rewards.get("points", 0),
                 "created": created,
             }
         )
@@ -3823,7 +3886,8 @@ def backfill_referral_codes():
     for user_doc in users_query.stream():
         scanned_count += 1
         user_data = user_doc.to_dict() or {}
-        if not user_data.get("referralCode"):
+        rewards = _get_rewards(user_doc.id)
+        if not rewards.get("referralCode"):
             missing_count += 1
 
         if dry_run:
@@ -3833,8 +3897,8 @@ def backfill_referral_codes():
             _code, created = ensure_referral_code(user_doc.id, user_data)
             if created:
                 assigned_count += 1
-            if "points" not in user_data:
-                user_doc.reference.set({"points": 0}, merge=True)
+            if "points" not in rewards:
+                _rewards_ref(user_doc.id).set({"points": 0}, merge=True)
         except Exception as e:
             errors.append({"userId": user_doc.id, "error": str(e)})
 
@@ -3891,6 +3955,9 @@ def sync_token_balance():
         return jsonify({"error": "Missing userId or additionalAmount"}), 400
 
     user_id = data["userId"]
+    err = _require_uid(user_id)
+    if err:
+        return err
     additional_amount = float(data["additionalAmount"])
 
     try:
@@ -4033,11 +4100,9 @@ def withdraw_tokens():
     stable_amount = float(data["amount"])
     to_address = data.get("toAddress")
 
-    uid = verify_firebase_token(request)
-    if not uid:
-        return jsonify({"error": "Missing or invalid authorization token"}), 401
-    if uid != user_id:
-        return jsonify({"error": "Forbidden"}), 403
+    err = _require_uid(user_id)
+    if err:
+        return err
 
     if stable_amount <= 0:
         return jsonify({"error": "Amount must be positive"}), 400
@@ -4208,6 +4273,9 @@ def burn_nft():
         return jsonify({"error": "Missing userId or tokenId"}), 400
 
     user_id = data["userId"]
+    err = _require_uid(user_id)
+    if err:
+        return err
     token_id = int(data["tokenId"])
 
     try:
@@ -4241,6 +4309,9 @@ def remint_post():
         return jsonify({"error": "Missing required fields"}), 400
 
     user_id = data["userId"]
+    err = _require_uid(user_id)
+    if err:
+        return err
     token_id = int(data["tokenId"])
     is_private = data.get("isPrivate", False)
     ipfs_url = data.get("ipfsUrl", "")
@@ -4303,11 +4374,9 @@ def toggle_privacy():
     user_id = data["userId"]
     is_private = data["isPrivate"]
 
-    uid = verify_firebase_token(request)
-    if not uid:
-        return jsonify({"error": "Missing or invalid authorization token"}), 401
-    if uid != user_id:
-        return jsonify({"error": "Forbidden"}), 403
+    err = _require_uid(user_id)
+    if err:
+        return err
 
     try:
         # Read all user's posts from Firestore
@@ -4715,6 +4784,17 @@ def stitch_videos():
     text_overlay = request.form.get("text_overlay", "").strip()
     text_font_size = request.form.get("text_font_size", "48")
     text_color = request.form.get("text_color", "white")
+    # Post metadata: the server writes the posts/{id} doc itself (client no longer
+    # calls savePost), so rankScore/moderation/userId can't be forged from the client.
+    is_private = request.form.get("isPrivate", "false").lower() == "true"
+    caption = request.form.get("caption", "").strip() or None
+    circle_slug = request.form.get("circleSlug", "").strip() or None
+    collect_enabled = request.form.get("collectEnabled", "true").lower() != "false"
+    _collect_price_raw = request.form.get("collectPrice", "")
+    try:
+        collect_price = float(_collect_price_raw) if _collect_price_raw != "" else None
+    except ValueError:
+        collect_price = None
 
     if not uploaded_files or len(uploaded_files) < 2:
         return jsonify({"error": "At least 2 video files are required"}), 400
@@ -4854,6 +4934,19 @@ def stitch_videos():
         if hq_media_url:
             response_data["hqMediaUrl"] = hq_media_url
 
+        # Server is the sole writer of the post doc (the client no longer calls
+        # savePost), so rankScore / moderation / userId can't be forged client-side.
+        save_post_server(
+            token_id,
+            response_data,
+            user_id,
+            is_private,
+            caption,
+            circle_slug,
+            collect_enabled,
+            collect_price,
+        )
+
         return jsonify(response_data)
 
     except subprocess.TimeoutExpired:
@@ -4863,6 +4956,52 @@ def stitch_videos():
         return jsonify({"error": f"Error stitching videos: {e}"}), 500
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@app.route("/posts/<token_id>/sync-counts", methods=["POST"])
+def sync_post_counts(token_id):
+    """Recompute a post's social counters (likesCount, reactionCounts, commentsCount)
+    from the per-user leaf docs / comments and write them authoritatively. These
+    counters are NOT client-writable (Firestore rules), so this is the only path that
+    maintains them: a client can add/remove only its OWN like/reaction/comment doc, and
+    the true count is derived here — closing the counter-forgery hole (audit #1)."""
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Unauthorized"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    post_ref = firestore_db.collection("posts").document(str(token_id))
+    if not post_ref.get().exists:
+        return jsonify({"error": "Post not found"}), 404
+
+    # Derived from the leaf subcollections. O(n) reads — fine at current scale;
+    # switch to .count() aggregation queries if a post's likes/comments grow large.
+    # commentsCount counts every comment doc, including replies and soft-deleted
+    # tombstones (matches the old client semantics: soft-delete does not decrement).
+    likes_count = sum(1 for _ in post_ref.collection("likes").stream())
+    comments_count = sum(1 for _ in post_ref.collection("comments").stream())
+    reaction_counts = {}
+    for r in post_ref.collection("reactions").stream():
+        t = (r.to_dict() or {}).get("type")
+        if t:
+            reaction_counts[t] = reaction_counts.get(t, 0) + 1
+
+    post_ref.set(
+        {
+            "likesCount": likes_count,
+            "commentsCount": comments_count,
+            "reactionCounts": reaction_counts,
+        },
+        merge=True,
+    )
+    return jsonify(
+        {
+            "likesCount": likes_count,
+            "commentsCount": comments_count,
+            "reactionCounts": reaction_counts,
+        }
+    )
 
 
 # ============================================================
