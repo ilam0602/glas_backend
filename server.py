@@ -922,11 +922,20 @@ def compress_image(base64_str, target_width):
 
     Encode settings matter as much as size: quality 92 with 4:4:4 chroma
     (subsampling=0) avoids the ringing/color-bleed on high-contrast edges
-    (text, line art, logos) that quality-85 + default 4:2:0 produced. This is
-    the last lossy pass, so we keep it clean rather than compounding artifacts.
+    (text, line art, logos) that quality-85 + default 4:2:0 produced.
+
+    Pass-through: if the image already fits target_width and is a JPEG, it is
+    returned untouched. The client is the authoritative compressor
+    (normalizeImageForUpload downscales to 1080 and encodes once at high
+    quality); re-encoding here would only add a lossy JPEG generation for no
+    size or resolution gain. Oversized or non-JPEG inputs (e.g. imported PNGs,
+    or the 720p IPFS derivative) still get a single clean downscale+encode.
     """
     img_data = base64.b64decode(base64_str)
     img = PILImage.open(io.BytesIO(img_data))
+
+    if img.width <= target_width and img.format == "JPEG":
+        return base64_str
 
     # Only downscale, never upscale
     if img.width > target_width:
