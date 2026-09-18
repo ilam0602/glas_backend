@@ -10,6 +10,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
+COPY economy_v2.py .
+COPY payout_provider.py .
 COPY AuthenSnap.json .
 COPY Token.json .
 COPY Glas.json .
