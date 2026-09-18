@@ -8,6 +8,7 @@ import json
 import base64
 import re
 import hashlib
+import math
 import subprocess
 import secrets
 import tempfile
@@ -31,6 +32,26 @@ from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 from google.api_core.exceptions import AlreadyExists, NotFound
 from cryptography.fernet import Fernet
 from google.cloud import storage as gcs_storage
+from economy_v2 import (
+    creator_earning_usd,
+    spend_view_credits,
+    accrue_earning_usd,
+    settle_earning_usd,
+    view_credit_row,
+    earning_row,
+    InsufficientCredits,
+    InsufficientEarnings,
+)
+from payout_provider import (
+    get_payout_provider,
+    create_bridge_kyc_link,
+    crossmint_register_user,
+    crossmint_create_recipient_wallet,
+    stripe_create_connect_account,
+    stripe_create_account_link,
+    verify_bridge_webhook,
+    verify_crossmint_webhook,
+)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -303,6 +324,58 @@ def collect_split(price):
     platform_cut = min(PLATFORM_COLLECT_CUT, p)
     creator_earns = p - platform_cut
     return (p, creator_earns, platform_cut)
+
+
+class InsufficientFunds(Exception):
+    pass
+
+
+def read_balances(doc_dict):
+    """Return (purchasedBalance, earnedBalance). Each bucket resolves
+    independently: purchased falls back to legacy `balance` whenever
+    `purchasedBalance` is absent (even if `earnedBalance` was already written),
+    so an earning credit on a legacy doc can never strand the spendable balance."""
+    d = doc_dict or {}
+    purchased = d["purchasedBalance"] if "purchasedBalance" in d else d.get("balance", 0)
+    earned = d.get("earnedBalance", 0)
+    return (purchased, earned)
+
+
+def spend_purchased(purchased, earned, amount):
+    """Debit an in-app spend from the purchased bucket ONLY. Earned is never
+    touched (keystone invariant). Raises InsufficientFunds if purchased < amount."""
+    if purchased < amount:
+        raise InsufficientFunds()
+    return (purchased - amount, earned)
+
+
+def credit_earned(purchased, earned, amount):
+    """Credit creator earnings to the earned bucket ONLY."""
+    return (purchased, earned + amount)
+
+
+def debit_earned(purchased, earned, amount):
+    """Debit a withdrawal from the earned bucket ONLY. Purchased is never
+    touched (keystone invariant). Raises InsufficientFunds if earned < amount."""
+    if earned < amount:
+        raise InsufficientFunds()
+    return (purchased, earned - amount)
+
+
+def token_ledger_row(user_id, bucket, delta, reason, related_user_id=None, token_id=None):
+    """Build a tokenTransactions audit row. `bucket` in {'purchased','earned'};
+    `reason` in {purchase, signup_grant, collect_spend, view_spend,
+    collect_earning, view_earning, withdrawal}."""
+    return {
+        "userId": user_id,
+        "bucket": bucket,
+        "delta": delta,
+        "reason": reason,
+        "relatedUserId": related_user_id,
+        "tokenId": token_id,
+        "createdAt": datetime.now(timezone.utc),
+    }
+
 
 # ============================================================
 # Explore Feed Ranking Constants
@@ -1762,6 +1835,10 @@ def save_post_server(
         ),
         "rankScore": 0.354,
         "flagged": bool(response_data.get("flagged")),
+        # Non-custodial rebuild: distinguishes posts created under the new
+        # flow from pre-migration posts, which get custodyEra="legacy" via
+        # migrate_noncustodial.py's backfill.
+        "custodyEra": "noncustodial",
     }
     if response_data.get("hqMediaUrl"):
         post["hqMediaUrl"] = response_data["hqMediaUrl"]
@@ -3605,23 +3682,17 @@ def create_account():
         except Exception as e:
             print(f"Referral setup failed (non-blocking): {e}")
 
-    if not token_contract:
-        return jsonify({"error": "Token contract not configured"}), 500
-
-    user_id_hash = compute_user_id_hash(user_id)
-    amount = w3.to_wei(10000, "ether")  # 10,000 tokens
+    response_data["tokensGranted"] = 10000
 
     try:
-        mint_fn = token_contract.functions.mintToVirtual(user_id_hash, amount)
-        tx_hash, receipt = send_contract_transaction(mint_fn, 200000)
-
-        response_data["tokensGranted"] = 10000
-        response_data["transaction_hash"] = tx_hash.hex()
-
         if firestore_db:
             balance_ref = firestore_db.collection("tokenBalances").document(user_id)
             if not balance_ref.get().exists:
-                balance_ref.set({"balance": 10000, "lastOnChainBalance": 10000})
+                # Signup grant is spend-only (Purchased) and OFF-CHAIN. earned=0.
+                balance_ref.set({"purchasedBalance": 10000, "earnedBalance": 0})
+                firestore_db.collection("tokenTransactions").document().set(
+                    token_ledger_row(user_id, "purchased", 10000, "signup_grant")
+                )
 
         return jsonify(response_data)
     except Exception as e:
@@ -3786,7 +3857,7 @@ def referral_leaderboard():
     """
     GET endpoint for the all-time referral points leaderboard.
     Query params: limit (default 50, capped at 100)
-    Returns { leaderboard: [{ userId, email, displayName, points, rank }] }
+    Returns { leaderboard: [{ userId, displayName, points, rank }] }
     """
     if not firestore_db:
         return jsonify({"error": "Firebase not configured on server"}), 500
@@ -3810,21 +3881,17 @@ def referral_leaderboard():
             user_id = user_ref.id
             user_snap = user_ref.get()
             data = user_snap.to_dict() if user_snap.exists else {}
-            email = data.get("email") or ""
-            if not email:
-                post_query = (
-                    firestore_db.collection("posts")
-                    .where("userId", "==", user_id)
-                    .limit(1)
-                )
-                for post_doc in post_query.stream():
-                    email = post_doc.to_dict().get("userEmail") or ""
-                    break
-            display_name = email or data.get("displayName") or f"user_{user_id[:6]}"
+            # Never expose email/PII on this public endpoint: label with the
+            # public username/displayName only (clients resolve their own
+            # display via userInfo anyway), falling back to an opaque handle.
+            display_name = (
+                data.get("username")
+                or data.get("displayName")
+                or f"user_{user_id[:6]}"
+            )
             leaderboard.append(
                 {
                     "userId": user_id,
-                    "email": email,
                     "displayName": display_name,
                     "points": rewards.get("points", 0),
                     "rank": rank,
@@ -4139,6 +4206,11 @@ def get_withdrawal_info(user_id):
 
         max_single_glas = pool_balance * POOL_DRAIN_CAP_PERCENT
 
+        earned_balance = 0
+        if firestore_db:
+            _wb = firestore_db.collection("tokenBalances").document(user_id).get()
+            _pur, earned_balance = read_balances(_wb.to_dict() if _wb.exists else {})
+
         return jsonify(
             {
                 "dailyCapUsd": DAILY_WITHDRAWAL_CAP_USD,
@@ -4148,6 +4220,8 @@ def get_withdrawal_info(user_id):
                 "feePercent": WITHDRAWAL_FEE_PERCENT,
                 "maxSingleWithdrawalGlas": max_single_glas,
                 "poolBalance": pool_balance,
+                "earnedBalance": earned_balance,
+                "earnedUsd": earned_balance / STABLE_TOKEN_USD_RATE,
             }
         )
     except Exception as e:
@@ -4208,6 +4282,13 @@ def withdraw_tokens():
 
         # Calculate GLAS amount
         glas_amount = net_usd / glas_price_usd
+
+        # Two-bucket: only EARNED VW is withdrawable. Check BEFORE any on-chain op.
+        if firestore_db:
+            _wb = firestore_db.collection("tokenBalances").document(user_id).get()
+            _pur, _earn = read_balances(_wb.to_dict() if _wb.exists else {})
+            if _earn < stable_amount:
+                return jsonify({"error": "Insufficient earned balance"}), 400
 
         # 4. Guardrail 1: daily cap
         already_withdrawn = get_daily_withdrawal_usd(user_id)
@@ -4280,18 +4361,27 @@ def withdraw_tokens():
 
         if firestore_db:
             balance_ref = firestore_db.collection("tokenBalances").document(user_id)
-            bal_snap = balance_ref.get()
-            if bal_snap.exists:
-                bal = bal_snap.to_dict()
-                balance_ref.set(
-                    {
-                        "balance": bal.get("balance", 0) - stable_amount,
-                        "lastOnChainBalance": max(
-                            0, bal.get("lastOnChainBalance", 0) - stable_amount
-                        ),
-                    },
-                    merge=True,
-                )
+
+            @fb_firestore.transactional
+            def _debit(txn):
+                snap = balance_ref.get(transaction=txn)
+                pur, earn = read_balances(snap.to_dict() if snap.exists else {})
+                try:
+                    _, new_earn = debit_earned(pur, earn, stable_amount)
+                except InsufficientFunds:
+                    return False
+                txn.set(balance_ref, {
+                    "purchasedBalance": pur,
+                    "earnedBalance": new_earn,
+                    "lastOnChainBalance": max(0, (snap.to_dict() or {}).get("lastOnChainBalance", 0) - stable_amount),
+                }, merge=True)
+                txn.set(firestore_db.collection("tokenTransactions").document(),
+                        token_ledger_row(user_id, "earned", -stable_amount, "withdrawal"))
+                return True
+
+            debited_ok = _debit(firestore_db.transaction())
+            if not debited_ok:
+                print(f"[CRITICAL] withdraw reconciliation needed: user={user_id} stable={stable_amount} glas={glas_amount} — on-chain value moved but earnedBalance NOT debited (concurrent drain). Manual review required.", flush=True)
 
         response = {
             "success": True,
@@ -5506,8 +5596,12 @@ def verify_payment():
         balance_ref = firestore_db.collection("tokenBalances").document(user_id)
         batch.set(
             balance_ref,
-            {"balance": FirestoreIncrement(tokens)},
+            {"purchasedBalance": FirestoreIncrement(tokens)},
             merge=True,
+        )
+        batch.set(
+            firestore_db.collection("tokenTransactions").document(),
+            token_ledger_row(user_id, "purchased", tokens, "purchase"),
         )
 
         batch.set(completed_ref, {
@@ -5518,28 +5612,6 @@ def verify_payment():
         })
 
         batch.commit()
-
-        # 5. On-chain sync (non-fatal)
-        try:
-            if token_contract:
-                user_id_hash = compute_user_id_hash(user_id)
-                amount_wei = w3.to_wei(tokens, "ether")
-
-                mint_fn = token_contract.functions.mintToVirtual(
-                    user_id_hash, amount_wei
-                )
-                send_contract_transaction(mint_fn, 200000)
-
-                # Update last on-chain balance
-                balance_ref.set(
-                    {"lastOnChainBalance": FirestoreIncrement(tokens)},
-                    merge=True,
-                )
-                print(f"On-chain sync succeeded for user {user_id}: {tokens} tokens")
-            else:
-                print("Token contract not configured, skipping on-chain sync")
-        except Exception as sync_err:
-            print(f"On-chain sync failed (non-fatal): {sync_err}")
 
         return jsonify({"success": True, "tokens": tokens})
     except Exception as e:
@@ -5609,24 +5681,37 @@ def collect_post():
         p, creator_earns, platform_cut = collect_split(price)
 
         collector_snap = collector_ref.get(transaction=txn)
-        collector_balance = collector_snap.to_dict().get("balance", 0) if collector_snap.exists else 0
-        if collector_balance < p:
+        col_pur, col_earn = read_balances(collector_snap.to_dict() if collector_snap.exists else {})
+        try:
+            new_col_pur, _ = spend_purchased(col_pur, col_earn, p)
+        except InsufficientFunds:
             return {"status": "insufficient"}
 
         creator_snap = creator_ref.get(transaction=txn)
-        creator_data = creator_snap.to_dict() if creator_snap.exists else {"balance": 0, "lastOnChainBalance": 0}
+        creator_data = creator_snap.to_dict() if creator_snap.exists else {}
+        cre_pur, cre_earn = read_balances(creator_data)
+        _, new_cre_earn = credit_earned(cre_pur, cre_earn, creator_earns)
+        creator_last_on_chain = creator_data.get("lastOnChainBalance", 0)
+
         platform_snap = platform_ref.get(transaction=txn)
-        platform_data = platform_snap.to_dict() if platform_snap.exists else {"balance": 0, "lastOnChainBalance": 0}
+        platform_balance = (platform_snap.to_dict() or {}).get("balance", 0) if platform_snap.exists else 0
 
-        new_creator = creator_data.get("balance", 0) + creator_earns
-        new_platform = platform_data.get("balance", 0) + platform_cut
+        # Collector: debit Purchased only (earned untouched).
+        txn.set(collector_ref, {"purchasedBalance": new_col_pur}, merge=True)
+        # Creator: credit Earned only; keep on-chain bookkeeping (now tracks earned).
+        # Also persist purchasedBalance so a legacy/un-migrated creator doc self-migrates
+        # here instead of being left with an implicit-fallback purchased bucket.
+        txn.set(creator_ref, {"purchasedBalance": cre_pur, "earnedBalance": new_cre_earn, "lastOnChainBalance": creator_last_on_chain}, merge=True)
+        # Platform cut: unchanged (server revenue, not a user bucket).
+        txn.set(platform_ref, {"balance": platform_balance + platform_cut}, merge=True)
 
-        txn.set(collector_ref, {"balance": collector_balance - p}, merge=True)
-        txn.set(creator_ref, {"balance": new_creator, "lastOnChainBalance": creator_data.get("lastOnChainBalance", 0)}, merge=True)
-        txn.set(platform_ref, {"balance": new_platform, "lastOnChainBalance": platform_data.get("lastOnChainBalance", 0)}, merge=True)
         txn.set(collection_ref, {"tokenId": token_id, "collectorId": collector_id, "creatorId": creator_id, "createdAt": now_ms})
         txn.set(post_ref, {"collectsCount": FirestoreIncrement(1)}, merge=True)
-        return {"status": "ok", "creatorBalance": new_creator, "creatorLastOnChain": creator_data.get("lastOnChainBalance", 0)}
+        txn.set(firestore_db.collection("tokenTransactions").document(),
+                token_ledger_row(collector_id, "purchased", -p, "collect_spend", related_user_id=creator_id, token_id=token_id_str))
+        txn.set(firestore_db.collection("tokenTransactions").document(),
+                token_ledger_row(creator_id, "earned", creator_earns, "collect_earning", related_user_id=collector_id, token_id=token_id_str))
+        return {"status": "ok", "creatorEarned": new_cre_earn, "creatorLastOnChain": creator_last_on_chain}
 
     result = run(firestore_db.transaction())
     status = result["status"]
@@ -5636,7 +5721,7 @@ def collect_post():
         return jsonify({"error": "Collecting is turned off for this post"}), 400
     if status == "insufficient":
         return jsonify({"error": "Insufficient token balance"}), 400
-    _sync_creator_balance_async(creator_id, result["creatorBalance"], result["creatorLastOnChain"])
+    _sync_creator_balance_async(creator_id, result["creatorEarned"], result["creatorLastOnChain"])
     return jsonify({"collected": True})
 
 
@@ -5665,28 +5750,822 @@ def charge_view():
     @fb_firestore.transactional
     def run(txn):
         viewer_snap = viewer_ref.get(transaction=txn)
-        viewer_balance = viewer_snap.to_dict().get("balance", 0) if viewer_snap.exists else 0
-        if viewer_balance < VIEW_PRICE:
+        vw_pur, vw_earn = read_balances(viewer_snap.to_dict() if viewer_snap.exists else {})
+        try:
+            new_viewer_pur, _ = spend_purchased(vw_pur, vw_earn, VIEW_PRICE)
+        except InsufficientFunds:
             return {"status": "insufficient"}
+
         creator_snap = creator_ref.get(transaction=txn)
-        creator_data = creator_snap.to_dict() if creator_snap.exists else {"balance": 0, "lastOnChainBalance": 0}
+        creator_data = creator_snap.to_dict() if creator_snap.exists else {}
+        cre_pur, cre_earn = read_balances(creator_data)
+        _, new_cre_earn = credit_earned(cre_pur, cre_earn, VIEW_EARNING)
+        creator_last_on_chain = creator_data.get("lastOnChainBalance", 0)
+
         platform_snap = platform_ref.get(transaction=txn)
-        platform_data = platform_snap.to_dict() if platform_snap.exists else {"balance": 0, "lastOnChainBalance": 0}
+        platform_balance = (platform_snap.to_dict() or {}).get("balance", 0) if platform_snap.exists else 0
 
-        new_viewer = viewer_balance - VIEW_PRICE
-        new_creator = creator_data.get("balance", 0) + VIEW_EARNING
-        new_platform = platform_data.get("balance", 0) + (VIEW_PRICE - VIEW_EARNING)
-
-        txn.set(viewer_ref, {"balance": new_viewer}, merge=True)
-        txn.set(creator_ref, {"balance": new_creator, "lastOnChainBalance": creator_data.get("lastOnChainBalance", 0)}, merge=True)
-        txn.set(platform_ref, {"balance": new_platform, "lastOnChainBalance": platform_data.get("lastOnChainBalance", 0)}, merge=True)
-        return {"status": "ok", "viewerBalance": new_viewer, "creatorBalance": new_creator, "creatorLastOnChain": creator_data.get("lastOnChainBalance", 0)}
+        txn.set(viewer_ref, {"purchasedBalance": new_viewer_pur}, merge=True)
+        # Persist purchasedBalance too so a legacy/un-migrated creator doc self-migrates here.
+        txn.set(creator_ref, {"purchasedBalance": cre_pur, "earnedBalance": new_cre_earn, "lastOnChainBalance": creator_last_on_chain}, merge=True)
+        txn.set(platform_ref, {"balance": platform_balance + (VIEW_PRICE - VIEW_EARNING)}, merge=True)
+        txn.set(firestore_db.collection("tokenTransactions").document(),
+                token_ledger_row(viewer_id, "purchased", -VIEW_PRICE, "view_spend", related_user_id=creator_id))
+        txn.set(firestore_db.collection("tokenTransactions").document(),
+                token_ledger_row(creator_id, "earned", VIEW_EARNING, "view_earning", related_user_id=viewer_id))
+        return {"status": "ok", "viewerPurchased": new_viewer_pur, "creatorEarned": new_cre_earn, "creatorLastOnChain": creator_last_on_chain}
 
     result = run(firestore_db.transaction())
     if result["status"] == "insufficient":
         return jsonify({"error": "Insufficient token balance"}), 400
-    _sync_creator_balance_async(creator_id, result["creatorBalance"], result["creatorLastOnChain"])
-    return jsonify({"viewerBalance": result["viewerBalance"], "creatorBalance": result["creatorBalance"]})
+    _sync_creator_balance_async(creator_id, result["creatorEarned"], result["creatorLastOnChain"])
+    return jsonify({"viewerBalance": result["viewerPurchased"], "creatorBalance": result["creatorEarned"]})
+
+
+# --- Non-custodial rebuild: view credits (spend-only) + earnings (USD) -----
+# --- Apple In-App Purchase: token top-ups -----------------------------------
+# IAP is the ONLY App-Store-compliant way to sell digital tokens on iOS
+# (Guideline 3.1.1). The client completes the StoreKit purchase and POSTs the
+# receipt here; we verify it with Apple, credit the buyer's LIVE spendable
+# balance — tokenBalances.purchasedBalance, the SAME bucket /collect-post and
+# /charge-view debit and the Stripe checkout credits — and record it on
+# tokenTransactions. Idempotent per Apple transaction id (iapPurchases/{id},
+# first-write-wins) so a replayed/retried/shared receipt never double-credits.
+# The SERVER is the source of truth for how many tokens a product grants — the
+# client's productId is looked up here, its amounts are never trusted.
+# NOTE: the viewCredits/earnings ledgers are the not-yet-live non-custodial
+# layer; IAP intentionally funds the live purchasedBalance so bought tokens are
+# immediately spendable on collect/view. Revisit if spend moves to viewCredits.
+
+APPLE_BUNDLE_ID = os.getenv("APPLE_BUNDLE_ID", "com.saclam.glass-mobile")
+APPLE_VERIFY_RECEIPT_PROD = "https://buy.itunes.apple.com/verifyReceipt"
+APPLE_VERIFY_RECEIPT_SANDBOX = "https://sandbox.itunes.apple.com/verifyReceipt"
+
+# productId -> tokens granted (credited to purchasedBalance). Prices/currency
+# are set in App Store Connect; only the token grant lives here. Product ids
+# must match the consumables created in App Store Connect.
+IAP_PRODUCTS = {
+    "com.saclam.glass-mobile.viewcredits.small": 1000,
+    "com.saclam.glass-mobile.viewcredits.medium": 5500,
+    "com.saclam.glass-mobile.viewcredits.large": 12000,
+}
+
+
+def _apple_verify_receipt(receipt_data):
+    """Verify a base64 App Store receipt with Apple. Tries production first and
+    falls back to sandbox on status 21007 (Apple's documented flow, required so
+    sandbox/TestFlight receipts validate). Returns Apple's parsed JSON."""
+    import requests as _requests
+
+    body = {"receipt-data": receipt_data}
+    shared_secret = os.getenv("APPLE_SHARED_SECRET")
+    if shared_secret:
+        body["password"] = shared_secret
+    resp = _requests.post(APPLE_VERIFY_RECEIPT_PROD, json=body, timeout=30)
+    payload = resp.json()
+    if payload.get("status") == 21007:  # sandbox receipt sent to production
+        resp = _requests.post(APPLE_VERIFY_RECEIPT_SANDBOX, json=body, timeout=30)
+        payload = resp.json()
+    return payload
+
+
+@app.route("/iap/validate", methods=["POST"])
+def iap_validate():
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    data = request.get_json(silent=True) or {}
+    receipt_data = data.get("receipt")
+    product_id = data.get("productId")
+    if not receipt_data or not product_id:
+        return jsonify({"error": "receipt and productId are required"}), 400
+
+    tokens = IAP_PRODUCTS.get(product_id)
+    if not tokens:
+        return jsonify({"error": "unknown_product"}), 400
+
+    try:
+        payload = _apple_verify_receipt(receipt_data)
+    except Exception as e:
+        print(f"[iap] verifyReceipt call failed for {uid}: {e}", flush=True)
+        return jsonify({"error": "verify_failed"}), 502
+
+    if payload.get("status") != 0:
+        print(f"[iap] receipt invalid for {uid}: status={payload.get('status')}", flush=True)
+        return jsonify({"error": "invalid_receipt"}), 400
+
+    receipt = payload.get("receipt", {}) or {}
+    # Anti-cross-app: the receipt's bundle id must be ours.
+    if receipt.get("bundle_id") != APPLE_BUNDLE_ID:
+        print(f"[iap] bundle mismatch for {uid}: {receipt.get('bundle_id')!r}", flush=True)
+        return jsonify({"error": "invalid_receipt"}), 400
+
+    # Consumables appear under in_app; find the transaction(s) for this product
+    # and take the most recent by purchase time.
+    in_app = receipt.get("in_app") or payload.get("latest_receipt_info") or []
+    matching = [t for t in in_app if t.get("product_id") == product_id]
+    if not matching:
+        return jsonify({"error": "product_not_in_receipt"}), 400
+    latest = max(matching, key=lambda t: int(t.get("purchase_date_ms", "0") or "0"))
+    transaction_id = latest.get("transaction_id")
+    if not transaction_id:
+        return jsonify({"error": "invalid_receipt"}), 400
+
+    purchase_ref = firestore_db.collection("iapPurchases").document(str(transaction_id))
+    balance_ref = firestore_db.collection("tokenBalances").document(uid)
+
+    @fb_firestore.transactional
+    def run(txn):
+        bal_snap = balance_ref.get(transaction=txn)
+        purchased = (bal_snap.to_dict() or {}).get("purchasedBalance", 0) if bal_snap.exists else 0
+        # First-write-wins idempotency: this exact Apple transaction is redeemable once.
+        if purchase_ref.get(transaction=txn).exists:
+            return {"status": "already_processed", "balance": purchased}
+        new_purchased = purchased + tokens
+        txn.set(balance_ref, {"purchasedBalance": new_purchased}, merge=True)
+        txn.set(purchase_ref, {
+            "uid": uid,
+            "productId": product_id,
+            "tokens": tokens,
+            "transactionId": str(transaction_id),
+            "createdAt": datetime.now(timezone.utc),
+        })
+        txn.set(
+            firestore_db.collection("tokenTransactions").document(),
+            token_ledger_row(uid, "purchased", tokens, "purchase"),
+        )
+        return {"status": "ok", "balance": new_purchased}
+
+    result = run(firestore_db.transaction())
+    return jsonify({"success": True, **result})
+
+
+# Keystone: viewCredits and earnings are separate collections/ledgers. This
+# endpoint ONLY debits the viewer's viewCredits and ONLY credits the
+# creator's earnings — it never writes the viewer's earnings or the
+# creator's viewCredits, so no path bridges a single user's two systems.
+
+@app.route("/view/spend", methods=["POST"])
+def view_spend():
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    data = request.get_json(silent=True) or {}
+    token_id = data.get("tokenId")
+    view_nonce = data.get("viewNonce")
+    if token_id is None:
+        return jsonify({"error": "tokenId is required"}), 400
+    if not view_nonce:
+        return jsonify({"error": "viewNonce is required"}), 400
+
+    viewer_id = uid
+    token_id_str = str(token_id)
+    # Creator is derived from the post doc server-side (never trusted from the
+    # request body) so a caller can't name themselves creator and launder
+    # non-refundable view-credits into withdrawable earnings.
+    post_ref = firestore_db.collection("posts").document(token_id_str)
+    viewer_ref = firestore_db.collection("viewCredits").document(viewer_id)
+    dedup_ref = firestore_db.collection("viewSpends").document(f"{token_id_str}_{viewer_id}_{view_nonce}")
+
+    @fb_firestore.transactional
+    def run(txn):
+        # Idempotency: a client-supplied per-view nonce. Views are legitimately
+        # repeatable, so we dedup on (tokenId, viewer, nonce), not permanently.
+        if dedup_ref.get(transaction=txn).exists:
+            return {"status": "deduped"}
+
+        post_snap = post_ref.get(transaction=txn)
+        if not post_snap.exists:
+            return {"status": "post_not_found"}
+        creator_id = (post_snap.to_dict() or {}).get("userId")
+        if not creator_id:
+            return {"status": "post_not_found"}
+        if creator_id == viewer_id:
+            return {"status": "self_view"}
+
+        creator_ref = firestore_db.collection("earnings").document(creator_id)
+
+        viewer_snap = viewer_ref.get(transaction=txn)
+        balance = (viewer_snap.to_dict() or {}).get("balance", 0) if viewer_snap.exists else 0
+        try:
+            new_balance = spend_view_credits(balance, 1)
+        except InsufficientCredits:
+            return {"status": "insufficient"}
+
+        creator_snap = creator_ref.get(transaction=txn)
+        creator_data = creator_snap.to_dict() if creator_snap.exists else {}
+        available_usd = creator_data.get("availableUsd", 0)
+        lifetime_usd = creator_data.get("lifetimeUsd", 0)
+        delta_usd = creator_earning_usd(1)
+        new_available_usd, new_lifetime_usd = accrue_earning_usd(available_usd, lifetime_usd, delta_usd)
+
+        # Viewer: debit viewCredits only.
+        txn.set(viewer_ref, {"balance": new_balance}, merge=True)
+        # Creator: credit earnings only.
+        txn.set(creator_ref, {"availableUsd": new_available_usd, "lifetimeUsd": new_lifetime_usd}, merge=True)
+        # Idempotency marker for this exact view action.
+        txn.set(dedup_ref, {"viewerId": viewer_id, "tokenId": token_id_str,
+                            "createdAt": datetime.now(timezone.utc)})
+
+        txn.set(firestore_db.collection("viewCreditLedger").document(),
+                view_credit_row(viewer_id, -1, "view_spend", token_id=token_id_str))
+        txn.set(firestore_db.collection("earningsLedger").document(),
+                earning_row(creator_id, delta_usd, "view_earning", related_uid=viewer_id, token_id=token_id_str))
+        return {"status": "ok", "balance": new_balance, "availableUsd": new_available_usd, "lifetimeUsd": new_lifetime_usd}
+
+    result = run(firestore_db.transaction())
+    status = result["status"]
+    if status == "deduped":
+        return jsonify({"deduped": True})
+    if status == "post_not_found":
+        return jsonify({"error": "post not found"}), 404
+    if status == "self_view":
+        return jsonify({"error": "cannot earn from your own post"}), 400
+    if status == "insufficient":
+        return jsonify({"error": "insufficient"}), 402
+    return jsonify({"balance": result["balance"]})
+
+
+@app.route("/earnings/summary", methods=["GET"])
+def earnings_summary():
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    snap = firestore_db.collection("earnings").document(uid).get()
+    data = snap.to_dict() if snap.exists else {}
+    return jsonify({
+        "availableUsd": data.get("availableUsd", 0),
+        "lifetimeUsd": data.get("lifetimeUsd", 0),
+    })
+
+
+# Keystone: /earnings/cash-out only ever touches `earnings` (never
+# `viewCredits`) — it settles a creator's own USD earnings out to their own
+# wallet via a licensed payout provider. It never reads or writes viewCredits,
+# so non-refundable view-credit spend can never be laundered into a payout.
+@app.route("/earnings/cash-out", methods=["POST"])
+def earnings_cash_out():
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    user_doc = firestore_db.collection("users").document(uid).get()
+    user_data = user_doc.to_dict() if user_doc.exists else {}
+
+    provider_name = os.getenv("PAYOUT_PROVIDER", "fake").strip().lower() or "fake"
+
+    # `recipient` is what deliver() targets. Its meaning is provider-specific:
+    # for Stripe it's the creator's connected-account id (acct_...) and the KYC
+    # gate is the account being payouts_enabled (live-read, no webhook needed);
+    # for Bridge/Crossmint it's the creator's wallet address and the gate is the
+    # stored payoutKycStatus == "verified".
+    if provider_name == "stripe":
+        recipient = user_data.get("stripeConnectAccountId")
+        if not recipient:
+            return jsonify({"error": "wallet_required"}), 400
+        try:
+            import stripe
+
+            acct = stripe.Account.retrieve(recipient)
+            if not acct.get("payouts_enabled"):
+                return jsonify({"error": "kyc_required"}), 403
+        except Exception as e:
+            print(f"[payout] stripe cash-out gate retrieve failed for {uid}: {e}", flush=True)
+            return jsonify({"error": "kyc_required"}), 403
+    else:
+        recipient = user_data.get("walletAddress")
+        if not recipient:
+            return jsonify({"error": "wallet_required"}), 400
+        if user_data.get("payoutKycStatus") != "verified":
+            return jsonify({"error": "kyc_required"}), 403
+
+    data = request.get_json(silent=True) or {}
+    requested = data.get("amountUsd")
+
+    earnings_ref = firestore_db.collection("earnings").document(uid)
+    earnings_snap = earnings_ref.get()
+    earnings_data = earnings_snap.to_dict() if earnings_snap.exists else {}
+    available_usd = earnings_data.get("availableUsd", 0)
+
+    if requested == "all":
+        amount_usd = available_usd
+    else:
+        try:
+            amount_usd = float(requested)
+        except (TypeError, ValueError):
+            return jsonify({"error": "amountUsd is required"}), 400
+
+    # Reject non-finite (NaN/inf) or non-positive amounts BEFORE any provider
+    # call or transaction. NaN compares False to everything, so without this a
+    # NaN amount slips past the positivity/insufficient checks below and
+    # settle_earning_usd would write NaN to availableUsd, permanently breaking
+    # the balance ceiling. (economy_v2 also guards this — defense in depth.)
+    if not math.isfinite(amount_usd) or amount_usd <= 0:
+        return jsonify({"error": "invalid amount"}), 400
+    if amount_usd > available_usd:
+        return jsonify({"error": "insufficient_earnings"}), 402
+
+    # The provider call actually moves money in the real implementation. With
+    # the FAKE provider this is a no-op, so calling deliver() before the
+    # transactional settle below is safe for now. In the REAL implementation
+    # (Stripe/Bridge), this ordering needs the same care as the legacy
+    # custodial withdraw path: either reserve the earnings (debit/hold) BEFORE
+    # calling deliver() and refund on provider failure, or reconcile
+    # after-the-fact against the provider's transfer status — a bare
+    # "deliver then settle" is only correct because the fake never fails and
+    # never actually moves funds. Flagged for the real-wiring phase.
+    provider = get_payout_provider()
+    # `bridgeCustomerId` is the creator's Bridge customer id, used as
+    # `on_behalf_of` on the transfer. It will be None until the (separate,
+    # not-yet-built) creator -> Bridge-customer/KYC onboarding flow exists;
+    # in production Bridge itself will reject transfers with no/unverified
+    # on_behalf_of, which is the correct failure mode until that flow ships.
+    bridge_customer_id = user_data.get("bridgeCustomerId")
+    # Wrap ONLY the provider call. The transactional settle below runs solely
+    # on a successful deliver(). For the Crossmint provider, deliver() raises
+    # (RuntimeError) if the recipient's KYC is still processing after its
+    # internal retry loop exhausts — this is BEFORE the earnings-settle
+    # transaction, so no money has moved and no ledger row was written, i.e.
+    # nothing to undo on the error path. Return a clean, actionable status
+    # instead of an unhandled 500: a KYC-pending failure is retriable (409
+    # "try again shortly"); any other provider failure is a 502.
+    try:
+        payout_result = provider.deliver(
+            recipient, amount_usd, "USDC", on_behalf_of=bridge_customer_id
+        )
+    except Exception as e:
+        # Log the full provider error server-side only. Do NOT echo it back to
+        # the client — the raw Crossmint/provider exception text can contain
+        # recipient PII, wallet details, or internal API error bodies (security
+        # review: MEDIUM, PII/internal-detail leak). The substring inspection
+        # of str(e) below stays server-side and is used ONLY to pick the status
+        # code; the message itself is never returned.
+        print(f"[payout] cash-out deliver failed for {uid}: {e}", flush=True)
+        lowered = str(e).lower()
+        if any(marker in lowered for marker in ("kyc", "processing", "in progress")):
+            return jsonify({"error": "payout_pending"}), 409
+        return jsonify({"error": "payout_failed"}), 502
+
+    @fb_firestore.transactional
+    def run(txn):
+        snap = earnings_ref.get(transaction=txn)
+        current_available = (snap.to_dict() or {}).get("availableUsd", 0) if snap.exists else 0
+        try:
+            new_available = settle_earning_usd(current_available, amount_usd)
+        except InsufficientEarnings:
+            return {"status": "insufficient"}
+
+        txn.set(earnings_ref, {"availableUsd": new_available}, merge=True)
+        txn.set(
+            firestore_db.collection("earningsLedger").document(),
+            earning_row(
+                uid,
+                -amount_usd,
+                "payout",
+                payout={
+                    "provider": provider_name,
+                    "providerRef": payout_result["providerRef"],
+                    "chain": payout_result["chain"],
+                    "asset": payout_result["asset"],
+                    "amount": payout_result["amount"],
+                    "marketRateUsd": payout_result["marketRateUsd"],
+                    # For real providers (Bridge) this is None/pending at
+                    # write time — the on-chain tx hash only arrives later
+                    # via the (not-yet-built) settlement webhook, which is a
+                    # separate follow-on task. The earnings settle still
+                    # happens transactionally regardless of pending status.
+                    "settlementTxHash": payout_result["settlementTxHash"],
+                    "status": payout_result.get("status", "settled"),
+                },
+            ),
+        )
+        return {"status": "ok", "availableUsd": new_available}
+
+    result = run(firestore_db.transaction())
+    if result["status"] == "insufficient":
+        return jsonify({"error": "insufficient_earnings"}), 402
+
+    return jsonify({
+        "settlementTxHash": payout_result["settlementTxHash"],
+        "status": payout_result.get("status", "settled"),
+        "availableUsd": result["availableUsd"],
+    })
+
+
+# Payout recipient onboarding. Branches on PAYOUT_PROVIDER:
+#
+#   - "crossmint": Crossmint's `regulated-transfer` transactionType rejects
+#     raw addresses — it can only pay a Crossmint-managed wallet OWNED by a
+#     registered Crossmint user (see payout_provider.py's module docstring
+#     and CrossmintPayoutProvider docstring for the full rationale). So this
+#     branch (1) registers the creator as a Crossmint user
+#     (`crossmint_register_user`), then (2) creates a Crossmint-managed
+#     wallet owned by them (`crossmint_create_recipient_wallet`), and stores
+#     the resulting wallet address as the creator's own `walletAddress` —
+#     that's the address /earnings/cash-out pays out to.
+#
+#     RULING — payoutKycStatus for Crossmint: Crossmint enforces KYC/AML on
+#     the recipient at TRANSFER time (not at onboarding time), so unlike
+#     Bridge there is no separate "kyc approved" signal this endpoint could
+#     wait on. glas's own `payoutKycStatus == "verified"` gate is therefore
+#     SECONDARY for the Crossmint provider — we set it to "verified" here,
+#     immediately after successful user+wallet creation, purely so
+#     /earnings/cash-out's gate doesn't block a creator who has completed
+#     everything glas controls. Crossmint's own KYC/AML check at transfer
+#     time (and CrossmintPayoutProvider.deliver()'s KYC-pending retry) is
+#     the actual enforcement mechanism from here on.
+#
+#   - default/"bridge": unchanged legacy Bridge KYC-link flow. This endpoint
+#     only ever STARTS Bridge KYC; it never itself sets payoutKycStatus to
+#     "verified" — creates the `bridgeCustomerId` + `payoutKycStatus` fields
+#     on `users/{uid}` that /earnings/cash-out gates on
+#     (`payoutKycStatus == "verified"`) and uses (`bridgeCustomerId` as
+#     `on_behalf_of`).
+@app.route("/payout/onboard", methods=["POST"])
+def payout_onboard():
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    data = request.get_json(silent=True) or {}
+    provider_name = os.getenv("PAYOUT_PROVIDER", "fake").strip().lower() or "fake"
+
+    if provider_name == "stripe":
+        # Stripe stablecoin payouts are a Connect feature: the creator gets an
+        # Express connected account and completes KYC + links their own crypto
+        # wallet inside Stripe's hosted onboarding (we never collect the
+        # wallet). Reuse an existing account on re-onboard (idempotent).
+        email = (data.get("email") or "").strip() or _user_email(uid)
+        if not email:
+            return jsonify({"error": "email is required"}), 400
+        country = (data.get("country") or "US").strip() or "US"
+
+        existing_doc = firestore_db.collection("users").document(uid).get()
+        existing_account = (
+            (existing_doc.to_dict() or {}).get("stripeConnectAccountId")
+            if existing_doc.exists
+            else None
+        )
+        try:
+            account_id = existing_account or stripe_create_connect_account(
+                email, country, metadata={"uid": uid}
+            )
+            if not existing_account:
+                firestore_db.collection("users").document(uid).set(
+                    {"stripeConnectAccountId": account_id}, merge=True
+                )
+            base = (os.getenv("PUBLIC_BASE_URL") or request.host_url).rstrip("/")
+            onboarding_url = stripe_create_account_link(
+                account_id,
+                refresh_url=f"{base}/payout/refresh",
+                return_url=f"{base}/payout/return",
+            )
+        except Exception as e:
+            print(f"[payout] stripe onboard failed for {uid}: {e}", flush=True)
+            return jsonify({"error": "stripe_onboarding_failed"}), 502
+
+        return jsonify(
+            {"onboardingUrl": onboarding_url, "stripeConnectAccountId": account_id}
+        )
+
+    if provider_name == "crossmint":
+        email = (data.get("email") or "").strip() or _user_email(uid)
+        first_name = (data.get("firstName") or "").strip()
+        last_name = (data.get("lastName") or "").strip()
+        dob = (data.get("dob") or "").strip()
+        country = (data.get("country") or "US").strip() or "US"
+
+        if not email:
+            return jsonify({"error": "email is required"}), 400
+        if not first_name:
+            return jsonify({"error": "firstName is required"}), 400
+        if not last_name:
+            return jsonify({"error": "lastName is required"}), 400
+        if not dob:
+            return jsonify({"error": "dob is required"}), 400
+
+        try:
+            crossmint_register_user(email, first_name, last_name, dob, country)
+            wallet_address = crossmint_create_recipient_wallet(email)
+        except Exception as e:
+            return jsonify({"error": f"crossmint_onboarding_failed: {e}"}), 502
+
+        firestore_db.collection("users").document(uid).set(
+            {
+                "walletAddress": wallet_address,
+                "crossmintUserLocator": "email:" + email,
+                # See RULING above — Crossmint KYCs at transfer time, so
+                # glas's gate is secondary for this provider.
+                "payoutKycStatus": "verified",
+            },
+            merge=True,
+        )
+
+        return jsonify({"walletAddress": wallet_address, "status": "onboarded"})
+
+    # Default/"bridge" path — unchanged.
+    full_name = (data.get("fullName") or "").strip()
+    if not full_name:
+        return jsonify({"error": "fullName is required"}), 400
+
+    email = (data.get("email") or "").strip() or _user_email(uid)
+    if not email:
+        return jsonify({"error": "email is required"}), 400
+
+    try:
+        kyc = create_bridge_kyc_link(full_name, email)
+    except Exception as e:
+        return jsonify({"error": f"bridge_kyc_link_failed: {e}"}), 502
+
+    # Mapping note: Bridge's kyc_status is one of
+    # not_started|under_review|incomplete|approved|rejected. We persist the
+    # RAW Bridge status onto payoutKycStatus here — we do NOT translate it to
+    # "verified", even when Bridge already reports "approved". The
+    # /earnings/cash-out gate checks for the literal string "verified", which
+    # only the (separate, not-yet-built) KYC webhook (follow-on task P3) is
+    # allowed to set, once it has independently confirmed approval. This
+    # keeps /payout/onboard from ever being able to open the cash-out gate by
+    # itself.
+    firestore_db.collection("users").document(uid).set(
+        {
+            "bridgeCustomerId": kyc["customerId"],
+            "payoutKycStatus": kyc["kycStatus"],
+        },
+        merge=True,
+    )
+
+    return jsonify({"kycLink": kyc["kycLink"], "kycStatus": kyc["kycStatus"]})
+
+
+@app.route("/payout/status", methods=["GET"])
+def payout_status():
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    user_doc = firestore_db.collection("users").document(uid).get()
+    user_data = user_doc.to_dict() if user_doc.exists else {}
+
+    provider_name = os.getenv("PAYOUT_PROVIDER", "fake").strip().lower() or "fake"
+    if provider_name == "stripe":
+        # Live-read the connected account so this works without the (follow-on)
+        # account.updated webhook: payouts_enabled == KYC done + wallet linked.
+        account_id = user_data.get("stripeConnectAccountId")
+        payouts_enabled = False
+        if account_id:
+            try:
+                import stripe
+
+                acct = stripe.Account.retrieve(account_id)
+                payouts_enabled = bool(acct.get("payouts_enabled"))
+            except Exception as e:
+                print(f"[payout] stripe status retrieve failed for {uid}: {e}", flush=True)
+        return jsonify({
+            "payoutKycStatus": (
+                "verified" if payouts_enabled else ("pending" if account_id else None)
+            ),
+            "hasWallet": payouts_enabled,
+        })
+
+    return jsonify({
+        "payoutKycStatus": user_data.get("payoutKycStatus"),
+        "hasWallet": bool(user_data.get("walletAddress")),
+    })
+
+
+@app.route("/payout/return", methods=["GET"])
+def payout_return():
+    """Landing page after a creator finishes Stripe's hosted onboarding.
+    Stripe redirects the browser here; the app re-checks /payout/status."""
+    return (
+        "<html><body style='font-family:-apple-system,sans-serif;text-align:center;"
+        "padding:48px 24px'><h2>You're all set</h2><p>Return to the Glas app to cash "
+        "out your earnings.</p></body></html>",
+        200,
+        {"Content-Type": "text/html"},
+    )
+
+
+@app.route("/payout/refresh", methods=["GET"])
+def payout_refresh():
+    """Hit if a Stripe onboarding link expires before completion."""
+    return (
+        "<html><body style='font-family:-apple-system,sans-serif;text-align:center;"
+        "padding:48px 24px'><h2>Link expired</h2><p>Return to the Glas app and tap "
+        "&ldquo;Set up cash out&rdquo; again.</p></body></html>",
+        200,
+        {"Content-Type": "text/html"},
+    )
+
+
+@app.route("/webhooks/bridge", methods=["POST"])
+def webhooks_bridge():
+    """Bridge webhook receiver (follow-on task P3 referenced in
+    /payout/onboard's comment above). This endpoint is the ONLY writer
+    allowed to flip a user's `payoutKycStatus` to `"verified"`, which
+    unlocks real payouts via /earnings/cash-out — so signature verification
+    MUST run over the RAW body and MUST fail closed. A forgeable webhook
+    here is unlimited fraudulent payouts.
+
+    No Firebase auth token here (Bridge is not a logged-in user) — the RSA
+    signature (verified against BRIDGE_WEBHOOK_PUBLIC_KEY) is the entire
+    trust boundary for this route.
+    """
+    raw_body = request.get_data()  # RAW bytes — verification MUST run over
+    # exactly what Bridge signed, never a re-parsed/re-serialized body.
+    signature_header = request.headers.get("X-Webhook-Signature")
+
+    if not verify_bridge_webhook(raw_body, signature_header):
+        return jsonify({"error": "invalid_signature"}), 401
+
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    try:
+        event = json.loads(raw_body)
+    except (ValueError, TypeError):
+        return jsonify({"error": "invalid_json"}), 400
+
+    event_type = event.get("type")
+    # Wire-up note: the exact envelope key Bridge nests event fields under is
+    # unconfirmed against a real payload (spec says "an object with
+    # fields"). Accept either a nested `object` dict or a flat payload with
+    # `type` alongside the fields themselves — confirm against a real Bridge
+    # webhook before relying on this in production.
+    obj = event.get("object") if isinstance(event.get("object"), dict) else event
+
+    if event_type in ("kyc_link.updated", "customer.updated"):
+        kyc_status = obj.get("kyc_status")
+        customer_id = obj.get("customer_id")
+        if customer_id and kyc_status:
+            query = (
+                firestore_db.collection("users")
+                .where("bridgeCustomerId", "==", customer_id)
+                .limit(1)
+            )
+            docs = list(query.stream())
+            if docs:
+                # ONLY "approved" ever maps to "verified". Any other status
+                # (rejected/under_review/incomplete/...) is persisted
+                # verbatim, so a later rejection DOWNGRADES a previously
+                # verified user rather than leaving a stale "verified".
+                new_status = "verified" if kyc_status == "approved" else kyc_status
+                docs[0].reference.set({"payoutKycStatus": new_status}, merge=True)
+        return jsonify({"ok": True})
+
+    if event_type == "transfer.updated":
+        transfer_id = obj.get("id")
+        state = obj.get("state")
+        # Wire-up note: Bridge's exact field name for the on-chain
+        # settlement tx hash is NOT confirmed against a real
+        # `transfer.updated` payload. Try the plausible candidates (top
+        # level and nested under a `receipt`) and store whichever is
+        # present, else leave it unset. CONFIRM against a real webhook
+        # payload before relying on this in production.
+        receipt = obj.get("receipt") or {}
+        tx_hash = (
+            obj.get("destination_tx_hash")
+            or obj.get("transaction_hash")
+            or receipt.get("destination_tx_hash")
+            or receipt.get("transaction_hash")
+        )
+        if transfer_id:
+            query = (
+                firestore_db.collection("earningsLedger")
+                .where("payout.providerRef", "==", transfer_id)
+                .limit(1)
+            )
+            docs = list(query.stream())
+            if docs:
+                update = {}
+                if state is not None:
+                    update["payout.status"] = state
+                if tx_hash is not None:
+                    update["payout.settlementTxHash"] = tx_hash
+                if update:
+                    docs[0].reference.update(update)
+        return jsonify({"ok": True})
+
+    # Unknown event types: ack, no-op.
+    return jsonify({"ok": True})
+
+
+@app.route("/webhooks/crossmint", methods=["POST"])
+def webhooks_crossmint():
+    """Crossmint webhook receiver (Svix signature scheme) — the counterpart
+    to /webhooks/bridge above for the CrossmintPayoutProvider. This route's
+    ONLY job right now is back-filling `payout.settlementTxHash` +
+    `payout.status` on an `earningsLedger` row once Crossmint confirms a
+    transfer on-chain. No Firebase auth token here (Crossmint is not a
+    logged-in user) — the Svix HMAC signature (verified against
+    CROSSMINT_WEBHOOK_SECRET) is the entire trust boundary for this route,
+    so verification MUST run over the RAW body and MUST fail closed.
+    """
+    raw_body = request.get_data()  # RAW bytes — verification MUST run over
+    # exactly what Crossmint signed, never a re-parsed/re-serialized body.
+
+    if not verify_crossmint_webhook(raw_body, request.headers):
+        return jsonify({"error": "invalid_signature"}), 401
+
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    try:
+        event = json.loads(raw_body)
+    except (ValueError, TypeError):
+        return jsonify({"error": "invalid_json"}), 400
+
+    # Wire-up note: Crossmint's exact event envelope/type strings and
+    # payload field names are NOT confirmed against a real webhook payload
+    # (their transfer response shape is documented — the webhook event
+    # shape is not, as of this writing). This handles the transfer/
+    # transaction-updated case best-effort with guards, so any missing/
+    # unexpected field is a safe no-op rather than a crash. CONFIRM against
+    # a real Crossmint webhook before relying on this in production.
+    event_type = event.get("type") or event.get("event") or ""
+    obj = event.get("data") if isinstance(event.get("data"), dict) else event
+
+    is_transfer_event = (
+        isinstance(event_type, str)
+        and ("transfer" in event_type or "transaction" in event_type)
+    )
+    if is_transfer_event:
+        # Plausible id field names for "the transfer this event is about" —
+        # try the most likely candidates and no-op if none are present.
+        transfer_id = obj.get("id") or obj.get("transferId") or obj.get("transactionId")
+        status = obj.get("status")
+        on_chain = obj.get("onChain") if isinstance(obj.get("onChain"), dict) else {}
+        tx_hash = on_chain.get("txId") or obj.get("txId") or obj.get("transactionHash")
+
+        if transfer_id:
+            query = (
+                firestore_db.collection("earningsLedger")
+                .where("payout.providerRef", "==", transfer_id)
+                .limit(1)
+            )
+            docs = list(query.stream())
+            if docs:
+                update = {}
+                if status is not None:
+                    update["payout.status"] = status
+                if tx_hash is not None:
+                    update["payout.settlementTxHash"] = tx_hash
+                if update:
+                    docs[0].reference.update(update)
+        return jsonify({"ok": True})
+
+    # Unknown event types: ack, no-op.
+    return jsonify({"ok": True})
+
+
+@app.route("/view/balance", methods=["GET"])
+def view_balance():
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    snap = firestore_db.collection("viewCredits").document(uid).get()
+    data = snap.to_dict() if snap.exists else {}
+    return jsonify({"balance": data.get("balance", 0)})
+
+
+WALLET_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+
+@app.route("/wallet/register", methods=["POST"])
+def register_wallet_address():
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    data = request.get_json(silent=True) or {}
+    wallet_address = data.get("walletAddress")
+    if not wallet_address or not WALLET_ADDRESS_RE.match(wallet_address):
+        return jsonify({"error": "Invalid walletAddress"}), 400
+
+    firestore_db.collection("users").document(uid).set(
+        {"walletAddress": wallet_address}, merge=True
+    )
+    return jsonify({"walletAddress": wallet_address})
 
 
 if __name__ == "__main__":
