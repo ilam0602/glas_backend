@@ -93,6 +93,14 @@ FILEBASE_ENABLED = bool(FILEBASE_KEY and FILEBASE_SECRET and FILEBASE_BUCKET)
 # override with your Filebase dedicated gateway for faster marketplace previews).
 IPFS_GATEWAY = os.getenv("IPFS_GATEWAY", "https://ipfs.io/ipfs/")
 
+# Placeholder image used in the PUBLIC on-chain metadata of PRIVATE posts. Private
+# media is never published to public IPFS, so its NFT metadata must not point at the
+# real media — it points here instead. Host a real asset at this URL (or override via
+# env) so marketplaces/explorers show a neutral "private post" image.
+PRIVATE_POST_PLACEHOLDER_IMAGE = os.getenv(
+    "PRIVATE_POST_PLACEHOLDER_IMAGE", "https://glassocial.com/assets/private-post.png"
+)
+
 # Stripe for token purchases
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
@@ -1154,12 +1162,18 @@ def get_video_duration_seconds(video_bytes):
                 pass
 
 
-def process_mint_media_item(base64_data, media_type):
+def process_mint_media_item(base64_data, media_type, is_private=False):
     """
     Compress one media item (720p for IPFS, 1080p for GCS HQ), pin the 720p
     version to Pinata, and run AI moderation on it. Returns a dict consumed
     by /mint. Raises if the Pinata upload fails; compression failures fall
     back to the original bytes (same behavior as the old single-media path).
+
+    PUBLIC posts (is_private=False) are unchanged: the 720p derivative is pinned to
+    public IPFS. PRIVATE posts skip the public IPFS pin entirely (ipfs_url is None) so
+    private media never lands on a public, content-addressed network; the private media
+    is served only from access-controlled cloud storage (the 1080p GCS copy) via the
+    /unlock-post endpoint.
     """
     raw_bytes = base64.b64decode(base64_data)
 
@@ -1185,10 +1199,19 @@ def process_mint_media_item(base64_data, media_type):
         lq_base64 = base64_data
         hq_bytes = raw_bytes
 
-    ipfs_url = pin_file_to_ipfs(lq_base64, media_type=media_type)
-    print(
-        f"{'Video' if media_type == 'video' else 'Image'} (720p) uploaded to IPFS: {ipfs_url}"
-    )
+    if is_private:
+        # Private media is NOT published to public IPFS.
+        ipfs_url, ipfs_key = None, None
+        print(
+            f"Private {'video' if media_type == 'video' else 'image'}: skipped public IPFS pin (GCS-only)"
+        )
+    else:
+        ipfs_url, ipfs_key = pin_file_to_ipfs(
+            lq_base64, media_type=media_type, return_key=True
+        )
+        print(
+            f"{'Video' if media_type == 'video' else 'Image'} (720p) uploaded to IPFS: {ipfs_url}"
+        )
 
     if media_type == "video":
         analysis = analyze_video(raw_bytes)
@@ -1200,6 +1223,7 @@ def process_mint_media_item(base64_data, media_type):
         "raw_bytes": raw_bytes,
         "hq_bytes": hq_bytes,
         "ipfs_url": ipfs_url,
+        "ipfs_key": ipfs_key,
         "analysis": analysis,
         "duration_seconds": duration_seconds,
     }
@@ -1283,7 +1307,9 @@ def _filebase_put(key, data, content_type):
                 )
             if not cid:
                 raise Exception("Filebase did not return a CID for the upload")
-            return cid
+            # Return the object KEY too: Filebase (S3) deletes/unpins by key, not by
+            # CID, so the key must be persisted at mint time to enable later unpin.
+            return cid, key
         except Exception as e:
             last_err = e
             if attempt < 3:
@@ -1311,11 +1337,16 @@ def _pin_bytes_to_pinata(file_data, filename, content_type="application/octet-st
     raise Exception(f"Pinata upload error: {last_err}")
 
 
-def pin_file_to_ipfs(base64_image_str, media_type="photo"):
+def pin_file_to_ipfs(base64_image_str, media_type="photo", return_key=False):
     """
     Upload media to IPFS and return an ipfs:// URI. Uses Filebase when configured,
     otherwise falls back to Pinata. The CID (and thus the ipfs:// URI) is the same
     across providers because it is derived from the content itself.
+
+    When return_key=True, returns (ipfs_uri, provider_key) where provider_key is the
+    Filebase object key (needed for later unpin) or None for the Pinata path (Pinata
+    unpins by CID, which is recoverable from the URI). Existing callers that omit
+    return_key keep receiving just the ipfs_uri string, so their behavior is unchanged.
     """
     file_data = base64.b64decode(base64_image_str)
     is_video = media_type == "video"
@@ -1324,10 +1355,12 @@ def pin_file_to_ipfs(base64_image_str, media_type="photo"):
 
     if FILEBASE_ENABLED:
         ext = "mp4" if is_video else "png"
-        cid = _filebase_put(f"nft/{uuid.uuid4().hex}.{ext}", file_data, content_type)
-        return f"ipfs://{cid}"
+        cid, key = _filebase_put(f"nft/{uuid.uuid4().hex}.{ext}", file_data, content_type)
+        uri = f"ipfs://{cid}"
+        return (uri, key) if return_key else uri
 
-    return f"ipfs://{_pin_bytes_to_pinata(file_data, filename, content_type)}"
+    uri = f"ipfs://{_pin_bytes_to_pinata(file_data, filename, content_type)}"
+    return (uri, None) if return_key else uri
 
 
 def pin_metadata_to_ipfs(
@@ -1336,6 +1369,7 @@ def pin_metadata_to_ipfs(
     description="Photo minted on AuthenSnap",
     media_type="photo",
     media_items=None,
+    return_key=False,
 ):
     """
     Build the ERC-721 metadata JSON and pin it to IPFS (Filebase when configured,
@@ -1375,10 +1409,11 @@ def pin_metadata_to_ipfs(
 
     if FILEBASE_ENABLED:
         body = json.dumps(metadata).encode("utf-8")
-        cid = _filebase_put(
+        cid, key = _filebase_put(
             f"nft/metadata/{uuid.uuid4().hex}.json", body, "application/json"
         )
-        return f"ipfs://{cid}"
+        uri = f"ipfs://{cid}"
+        return (uri, key) if return_key else uri
 
     # Pinata fallback: pinJSONToIPFS.
     url = PINATA_PIN_JSON_URL
@@ -1387,13 +1422,84 @@ def pin_metadata_to_ipfs(
     for attempt in range(4):
         response = requests.post(url, json=metadata, headers=headers)
         if response.status_code == 200:
-            return f"ipfs://{response.json()['IpfsHash']}"
+            uri = f"ipfs://{response.json()['IpfsHash']}"
+            return (uri, None) if return_key else uri
         last_err = response.text
         if response.status_code in (429, 500, 502, 503, 504) and attempt < 3:
             time.sleep(2 ** attempt)
             continue
         break
     raise Exception(f"Pinata metadata upload error: {last_err}")
+
+
+def _unpin_from_pinata(cid):
+    """Best-effort Pinata unpin by CID. Returns True on success, False otherwise."""
+    if not (PINATA_API_KEY and PINATA_SECRET_API_KEY):
+        return False
+    try:
+        resp = requests.delete(
+            f"https://api.pinata.cloud/pinning/unpin/{cid}",
+            headers=_pinata_headers(),
+            timeout=15,
+        )
+        return resp.status_code in (200, 204)
+    except Exception as e:
+        print(f"[unpin] Pinata unpin {cid} failed: {e}")
+        return False
+
+
+def _extract_cid(ipfs_url):
+    """ipfs://<cid>[/...] or a gateway URL -> bare CID string, or None."""
+    if not ipfs_url or not isinstance(ipfs_url, str):
+        return None
+    s = ipfs_url
+    if s.startswith("ipfs://"):
+        s = s[len("ipfs://"):]
+    elif "/ipfs/" in s:
+        s = s.split("/ipfs/", 1)[1]
+    else:
+        return None
+    return (s.split("/", 1)[0].split("?", 1)[0]) or None
+
+
+def unpin_post_media(post_data):
+    """
+    Best-effort removal of a post's pinned IPFS content when the post is deleted.
+
+    - Filebase (primary): delete the stored object keys (Filebase deletes by KEY, so the
+      keys were persisted at mint time as `_ipfsKeys`). Only posts minted after that
+      change carry keys; older posts have none and are left untouched.
+    - Pinata (fallback/legacy): unpin any public CIDs by CID (harmless if not pinned
+      there).
+
+    Never raises. Because IPFS is distributed and content-addressed, deletion cannot be
+    guaranteed even after unpinning our own copies (documented in the Privacy Policy §7/§12
+    and Terms §11). Private posts hold no public media on IPFS, so only their placeholder
+    metadata object (if any) is removed.
+    """
+    if not isinstance(post_data, dict):
+        return
+    # 1. Filebase object keys (media + metadata) minted after the unpin change.
+    keys = post_data.get("_ipfsKeys") or []
+    if keys and FILEBASE_ENABLED:
+        try:
+            client = _get_filebase_client()
+            for key in keys:
+                try:
+                    client.delete_object(Bucket=FILEBASE_BUCKET, Key=key)
+                    print(f"[unpin] Filebase deleted {key}")
+                except Exception as e:
+                    print(f"[unpin] Filebase delete {key} failed: {e}")
+        except Exception as e:
+            print(f"[unpin] Filebase client error: {e}")
+    # 2. Pinata unpin by CID for any public media URLs (private posts store "" -> skipped).
+    urls = [post_data.get("ipfsUrl", "")]
+    for m in (post_data.get("media") or []):
+        urls.append(m.get("ipfsUrl", ""))
+    for u in urls:
+        cid = _extract_cid(u)
+        if cid:
+            _unpin_from_pinata(cid)
 
 
 def resolve_image_from_token_uri(token_uri):
@@ -1632,7 +1738,9 @@ def run_mint_pipeline(items_in, user_id, wallet_address, is_private, is_carousel
     processed = []
     for index, item in enumerate(items_in):
         try:
-            processed.append(process_mint_media_item(item["image"], item["mediaType"]))
+            processed.append(
+                process_mint_media_item(item["image"], item["mediaType"], is_private)
+            )
         except Exception as e:
             print(f"Item {index} Pinata upload failed: {e}")
             raise MintError(f"Error uploading item {index} to Pinata: {e}")
@@ -1657,16 +1765,28 @@ def run_mint_pipeline(items_in, user_id, wallet_address, is_private, is_carousel
     # 2. Create + pin ERC-721 metadata JSON
     try:
         token_name = "AuthenSnap Video" if media_type == "video" else "AuthenSnap Photo"
-        metadata_ipfs_url = pin_metadata_to_ipfs(
-            primary["ipfs_url"],
-            token_name,
-            media_type=media_type,
-            media_items=(
-                [(p["ipfs_url"], p["media_type"]) for p in processed]
-                if is_carousel
-                else None
-            ),
-        )
+        if is_private:
+            # Private posts must NOT expose their media in the PUBLIC on-chain metadata.
+            # Mint with a neutral placeholder image; the real media stays in GCS and is
+            # served via /unlock-post to the owner/followers only.
+            metadata_ipfs_url, metadata_key = pin_metadata_to_ipfs(
+                PRIVATE_POST_PLACEHOLDER_IMAGE,
+                token_name,
+                media_type=media_type,
+                return_key=True,
+            )
+        else:
+            metadata_ipfs_url, metadata_key = pin_metadata_to_ipfs(
+                primary["ipfs_url"],
+                token_name,
+                media_type=media_type,
+                media_items=(
+                    [(p["ipfs_url"], p["media_type"]) for p in processed]
+                    if is_carousel
+                    else None
+                ),
+                return_key=True,
+            )
         print(f"Metadata uploaded to IPFS: {metadata_ipfs_url}")
     except Exception as e:
         print(e)
@@ -1735,12 +1855,15 @@ def run_mint_pipeline(items_in, user_id, wallet_address, is_private, is_carousel
                 if item_thumb_url:
                     print(f"Video thumbnail uploaded: {item_thumb_url}")
 
-        # For private posts, encrypt URLs before returning.
-        item_ipfs = p["ipfs_url"]
+        # Private posts have NO public IPFS URL (media is GCS-only): store an empty
+        # ipfs_uri and Fernet-encrypt the GCS HQ URL — that encrypted reference is what
+        # /unlock-post decrypts for the owner/followers. Public posts are unchanged.
         if is_private:
-            item_ipfs = encrypt_url(item_ipfs)
+            item_ipfs = ""
             if item_hq_url:
                 item_hq_url = encrypt_url(item_hq_url)
+        else:
+            item_ipfs = p["ipfs_url"]
 
         media_items_out.append(
             {
@@ -1777,6 +1900,16 @@ def run_mint_pipeline(items_in, user_id, wallet_address, is_private, is_carousel
         response_data["user_id"] = user_id
     else:
         response_data["wallet_address"] = Web3.to_checksum_address(wallet_address)
+
+    # Filebase object keys for the pinned media + metadata, persisted so a later delete
+    # can unpin them (Filebase deletes by key, not CID). Empty for private media (never
+    # pinned) and for the Pinata path (unpinned by CID instead). Only posts minted after
+    # this change carry keys; older posts have none and are left untouched on delete.
+    ipfs_keys = [p["ipfs_key"] for p in processed if p.get("ipfs_key")]
+    if metadata_key:
+        ipfs_keys.append(metadata_key)
+    if ipfs_keys:
+        response_data["_ipfs_keys"] = ipfs_keys
     return response_data
 
 
@@ -1844,6 +1977,9 @@ def save_post_server(
         post["hqMediaUrl"] = response_data["hqMediaUrl"]
     if response_data.get("thumbnailUrl"):
         post["thumbnailUrl"] = response_data["thumbnailUrl"]
+    if response_data.get("_ipfs_keys"):
+        # Filebase object keys for best-effort unpin on delete (see run_mint_pipeline).
+        post["_ipfsKeys"] = response_data["_ipfs_keys"]
     if caption:
         post["caption"] = caption
     if circle_slug:
@@ -3830,9 +3966,10 @@ def delete_post(token_id):
     """
     Delete a post the caller owns. Owner is verified server-side (defense in
     depth beyond Firestore rules). Recursively removes the post doc and its
-    subcollections (likes, comments). The on-chain NFT and IPFS media are
-    permanent and are intentionally left as-is; earned points stay too (the
-    pointTransactions ledger keeps the audit trail).
+    subcollections (likes, comments), and makes a best-effort unpin of the post's
+    IPFS media/metadata (see unpin_post_media). The on-chain NFT is immutable and
+    stays; earned points stay too (the pointTransactions ledger keeps the audit
+    trail). IPFS deletion cannot be guaranteed once content has propagated.
     """
     uid = verify_firebase_token(request)
     if not uid:
@@ -3845,8 +3982,15 @@ def delete_post(token_id):
     snap = post_ref.get()
     if not snap.exists:
         return jsonify({"error": "Post not found"}), 404
-    if snap.to_dict().get("userId") != uid:
+    post_data = snap.to_dict() or {}
+    if post_data.get("userId") != uid:
         return jsonify({"error": "Not your post"}), 403
+
+    # Best-effort unpin BEFORE removing DB records (so we still have _ipfsKeys/urls).
+    try:
+        unpin_post_media(post_data)
+    except Exception as e:
+        print(f"[unpin] delete_post unpin failed (non-fatal): {e}")
 
     firestore_db.recursive_delete(post_ref)
     return jsonify({"success": True}), 200
@@ -4422,7 +4566,7 @@ def pin_file_bytes_to_ipfs(file_bytes, filename="stitched.mp4", content_type="vi
     """
     if FILEBASE_ENABLED:
         ext = filename.rsplit(".", 1)[-1] if "." in filename else "bin"
-        cid = _filebase_put(f"nft/{uuid.uuid4().hex}.{ext}", file_bytes, content_type)
+        cid, _key = _filebase_put(f"nft/{uuid.uuid4().hex}.{ext}", file_bytes, content_type)
         return f"ipfs://{cid}"
     return f"ipfs://{_pin_bytes_to_pinata(file_bytes, filename, content_type)}"
 
@@ -4482,13 +4626,21 @@ def remint_post():
     ipfs_url = data.get("ipfsUrl", "")
     hq_media_url = data.get("hqMediaUrl", "")
 
-    if not ipfs_url:
+    # Public reminting still needs the media URL; private posts don't (their media is
+    # not on public IPFS and the new metadata uses a placeholder), so allow empty ipfs.
+    if not is_private and not ipfs_url:
         return jsonify({"error": "Missing ipfsUrl"}), 400
 
     try:
-        # Create new ERC-721 metadata JSON and pin to Pinata
+        # Create new ERC-721 metadata JSON and pin to IPFS. When switching to PRIVATE,
+        # use a placeholder image so the public on-chain metadata never embeds the media.
+        # NOTE (public -> private): if this post's media was already published to public
+        # IPFS while it was public, that earlier copy may persist and cannot be guaranteed
+        # removed; only the NEW token's metadata is placeholder-only.
         token_name = "AuthenSnap Photo"
-        metadata_ipfs_url = pin_metadata_to_ipfs(ipfs_url, token_name)
+        metadata_ipfs_url = pin_metadata_to_ipfs(
+            PRIVATE_POST_PLACEHOLDER_IMAGE if is_private else ipfs_url, token_name
+        )
         print(f"Remint metadata uploaded to IPFS: {metadata_ipfs_url}")
 
         # Mint new token on-chain
@@ -4577,13 +4729,21 @@ def toggle_privacy():
             burn_fn = contract.functions.burnVirtual(user_id_hash, old_token_id)
             send_contract_transaction(burn_fn, 200000)
 
-            # 2. Create new metadata JSON and pin to Pinata
+            # 2. Create new metadata JSON and pin to IPFS. When switching to PRIVATE, use
+            # a placeholder image so the public on-chain metadata never embeds the media.
+            # NOTE (transition limits): media that was already published to public IPFS
+            # while the post was public may persist and cannot be guaranteed removed here;
+            # and a post originally CREATED private has no public IPFS media, so toggling
+            # it public leaves raw_ipfs_url empty (it stays viewable in-app via the GCS
+            # copy, but is not (re)published to public IPFS by this path).
             token_name = "AuthenSnap Photo"
             media_type = post_data.get("mediaType", "photo")
             if media_type == "video":
                 token_name = "AuthenSnap Video"
             metadata_ipfs_url = pin_metadata_to_ipfs(
-                raw_ipfs_url, token_name, media_type=media_type
+                PRIVATE_POST_PLACEHOLDER_IMAGE if is_private else raw_ipfs_url,
+                token_name,
+                media_type=media_type,
             )
 
             # 3. Mint new token
