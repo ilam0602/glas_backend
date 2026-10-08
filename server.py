@@ -2339,9 +2339,11 @@ def mint_async():
             items_in = _resolve_inline_fallback_items(items_in, upload_id)
         except _GcsNotConfiguredError as e:
             job_ref.update({"status": "failed", "error": str(e)})
+            _cleanup_mint_upload(upload_id)
             return jsonify({"error": str(e)}), 503
         except ValueError as e:
             job_ref.update({"status": "failed", "error": str(e)})
+            _cleanup_mint_upload(upload_id)
             return jsonify({"error": str(e)}), 400
         try:
             response_data = run_mint_pipeline(
@@ -2349,6 +2351,7 @@ def mint_async():
             )
         except MintError as e:
             job_ref.update({"status": "failed", "error": str(e)})
+            _cleanup_mint_upload(upload_id)
             return jsonify({"error": str(e)}), 500
         token_id = response_data["token_id"]
         save_post_server(
@@ -2359,6 +2362,7 @@ def mint_async():
         job_ref.update(
             {"status": "done", "tokenId": token_id, "finishedAt": SERVER_TIMESTAMP}
         )
+        _cleanup_mint_upload(upload_id)
         return (
             jsonify({"jobId": upload_id, "status": "done", "token_id": token_id}),
             200,
@@ -2430,19 +2434,28 @@ def mint_upload_url():
         return jsonify({"error": err}), status
 
     kind = data.get("objectKind")
-    if kind == "mint":
-        object_path = mint_upload_object_path(data["uploadId"], int(data.get("index", 0)))
-    elif kind == "story":
-        object_path = story_object_path(data["userId"], data["storyId"])
-    elif kind == "stitch":
-        object_path = stitch_object_path(data["stitchId"], int(data.get("index", 0)))
-    else:
-        return jsonify({"error": "Invalid objectKind"}), 400
+    try:
+        if kind == "mint":
+            object_path = mint_upload_object_path(data["uploadId"], int(data.get("index", 0)))
+        elif kind == "story":
+            object_path = story_object_path(data["userId"], data["storyId"])
+        elif kind == "stitch":
+            object_path = stitch_object_path(data["stitchId"], int(data.get("index", 0)))
+        else:
+            return jsonify({"error": "Invalid objectKind"}), 400
+    except KeyError as e:
+        return jsonify({"error": f"missing {e.args[0]} for objectKind {kind}"}), 400
+    except (TypeError, ValueError):
+        return jsonify({"error": f"invalid index for objectKind {kind}"}), 400
 
     required_headers = content_length_range_header(MAX_VIDEO_BYTES)
     blob = gcs_bucket.blob(object_path)
-    upload_url = generate_signed_url(
-        blob, method="PUT", expiration=timedelta(minutes=30), headers=required_headers)
+    try:
+        upload_url = generate_signed_url(
+            blob, method="PUT", expiration=timedelta(minutes=30), headers=required_headers)
+    except Exception as e:
+        print(f"[mint/upload-url] signing failed: {e}")
+        return jsonify({"error": "Could not generate upload URL"}), 500
     return jsonify({
         "uploadUrl": upload_url,
         "objectPath": object_path,
@@ -5378,6 +5391,10 @@ def stitch_videos():
 
     if should_mint and not user_id:
         return jsonify({"error": "userId is required when minting"}), 400
+    if should_mint and user_id:
+        uid = verify_firebase_token(request)
+        if not uid or uid != user_id:
+            return jsonify({"error": "Missing or invalid authorization token"}), 401
     if not gcs_bucket:
         return jsonify({"error": "Storage not configured"}), 500
 

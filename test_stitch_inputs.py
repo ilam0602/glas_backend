@@ -53,6 +53,7 @@ def test_stitch_endpoint_success_cleans_up_gcs_clips(monkeypatch):
     the path that a pure resolve_stitch_params unit test cannot cover."""
     deleted = []
     monkeypatch.setattr(server, "gcs_bucket", _FakeBucket(deleted))
+    monkeypatch.setattr(server, "verify_firebase_token", lambda req: "u1")
 
     def fake_run(cmd, **kwargs):
         # ffmpeg writes its output to the last positional arg; create it so the
@@ -74,3 +75,23 @@ def test_stitch_endpoint_success_cleans_up_gcs_clips(monkeypatch):
         "stitch_uploads/st9/1.mp4",
         "stitch_uploads/st9/2.mp4",
     ]
+
+
+def test_stitch_endpoint_requires_matching_uid_when_minting(monkeypatch):
+    """/stitch mints as the body's userId, so a caller must present a Firebase
+    token for that same uid -- otherwise anyone could mint posts attributed to
+    an arbitrary userId. Covers both no-token and mismatched-token cases."""
+    monkeypatch.setattr(server, "verify_firebase_token", lambda req: None)
+    r = app.test_client().post(
+        "/stitch",
+        json={"stitchId": "st10", "clipCount": 2, "userId": "u1"},
+    )
+    assert r.status_code == 401
+    assert "authorization" in r.get_json()["error"].lower()
+
+    monkeypatch.setattr(server, "verify_firebase_token", lambda req: "someone-else")
+    r = app.test_client().post(
+        "/stitch",
+        json={"stitchId": "st11", "clipCount": 2, "userId": "u1"},
+    )
+    assert r.status_code == 401

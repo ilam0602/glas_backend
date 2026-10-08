@@ -19,6 +19,16 @@ def test_upload_url_rejects_oversize(monkeypatch):
         "contentType": "video/mp4", "size": 5000})
     assert r.status_code == 413
 
+def test_upload_url_missing_field_returns_400(monkeypatch):
+    """objectKind 'mint' with no uploadId previously raised an unhandled
+    KeyError (-> raw 500). Should be a clean 400."""
+    monkeypatch.setattr(server, "verify_firebase_token", lambda req: "u1")
+    r = _client().post("/mint/upload-url", json={
+        "userId": "u1", "objectKind": "mint",
+        "contentType": "video/mp4", "size": 100})
+    assert r.status_code == 400
+    assert "error" in r.get_json()
+
 def test_upload_url_returns_signed_put(monkeypatch):
     monkeypatch.setattr(server, "verify_firebase_token", lambda req: "u1")
     monkeypatch.setattr(server, "MAX_VIDEO_BYTES", 150 * 1024 * 1024)
