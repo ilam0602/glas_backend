@@ -5319,50 +5319,79 @@ def delete_account():
     return jsonify({"deleted": True, "errors": errors})
 
 
+def resolve_stitch_params(data):
+    """Parse stitch params from a JSON (GCS-reference) request body."""
+    clip_count = int(data.get("clipCount", 0))
+    if clip_count < 2:
+        raise ValueError("At least 2 video clips are required")
+    collect_price_raw = data.get("collectPrice", "")
+    try:
+        collect_price = float(collect_price_raw) if collect_price_raw not in ("", None) else None
+    except (ValueError, TypeError):
+        collect_price = None
+    return {
+        "stitch_id": data["stitchId"],
+        "clip_count": clip_count,
+        "user_id": data.get("userId"),
+        "should_mint": str(data.get("mint", "true")).lower() == "true",
+        "text_overlay": (data.get("textOverlay") or "").strip(),
+        "text_font_size": str(data.get("textFontSize", "48")),
+        "text_color": data.get("textColor", "white"),
+        "is_private": bool(data.get("isPrivate", False)),
+        "caption": (data.get("caption") or "").strip() or None,
+        "circle_slug": (data.get("circleSlug") or "").strip() or None,
+        "collect_enabled": str(data.get("collectEnabled", "true")).lower() != "false",
+        "collect_price": collect_price,
+    }
+
+
 @app.route("/stitch", methods=["POST"])
 def stitch_videos():
     """
-    POST endpoint that accepts multipart form-data with:
-      - videos[]: multiple video files
+    POST endpoint that accepts a JSON body referencing clips already uploaded to GCS:
+      - stitchId: id used to locate uploaded clips at stitch_uploads/{stitchId}/{i}.mp4
+      - clipCount: number of clips (>= 2)
       - userId: Firebase user ID
       - mint: "true" or "false" (optional, default "true")
-      - text_overlay: optional text to burn into the video (static, full duration)
-      - text_font_size: optional font size for overlay (default 48)
-      - text_color: optional color for overlay (default "white")
+      - textOverlay: optional text to burn into the video (static, full duration)
+      - textFontSize: optional font size for overlay (default 48)
+      - textColor: optional color for overlay (default "white")
 
     Stitches videos with FFmpeg concat, optionally mints the result as an NFT.
     """
-    uploaded_files = request.files.getlist("videos[]")
-    user_id = request.form.get("userId")
-    should_mint = request.form.get("mint", "true").lower() == "true"
-    text_overlay = request.form.get("text_overlay", "").strip()
-    text_font_size = request.form.get("text_font_size", "48")
-    text_color = request.form.get("text_color", "white")
-    # Post metadata: the server writes the posts/{id} doc itself (client no longer
-    # calls savePost), so rankScore/moderation/userId can't be forged from the client.
-    is_private = request.form.get("isPrivate", "false").lower() == "true"
-    caption = request.form.get("caption", "").strip() or None
-    circle_slug = request.form.get("circleSlug", "").strip() or None
-    collect_enabled = request.form.get("collectEnabled", "true").lower() != "false"
-    _collect_price_raw = request.form.get("collectPrice", "")
+    data = request.get_json(silent=True) or {}
     try:
-        collect_price = float(_collect_price_raw) if _collect_price_raw != "" else None
-    except ValueError:
-        collect_price = None
+        p = resolve_stitch_params(data)
+    except (ValueError, KeyError) as e:
+        return jsonify({"error": str(e) or "Invalid stitch request"}), 400
 
-    if not uploaded_files or len(uploaded_files) < 2:
-        return jsonify({"error": "At least 2 video files are required"}), 400
+    user_id = p["user_id"]
+    should_mint = p["should_mint"]
+    text_overlay = p["text_overlay"]
+    text_font_size = p["text_font_size"]
+    text_color = p["text_color"]
+    is_private = p["is_private"]
+    caption = p["caption"]
+    circle_slug = p["circle_slug"]
+    collect_enabled = p["collect_enabled"]
+    collect_price = p["collect_price"]
 
     if should_mint and not user_id:
         return jsonify({"error": "userId is required when minting"}), 400
+    if not gcs_bucket:
+        return jsonify({"error": "Storage not configured"}), 500
 
     tmp_dir = tempfile.mkdtemp()
     try:
-        # Save uploaded files to temp directory
+        # Download clips from GCS (uploaded by the client via /mint/upload-url
+        # with objectKind "stitch") into the temp directory.
         input_paths = []
-        for i, f in enumerate(uploaded_files):
+        for i in range(p["clip_count"]):
+            blob = gcs_bucket.blob(stitch_object_path(p["stitch_id"], i))
+            if not blob.exists():
+                return jsonify({"error": f"Clip {i} not found"}), 400
             path = os.path.join(tmp_dir, f"clip_{i}.mp4")
-            f.save(path)
+            blob.download_to_filename(path)
             input_paths.append(path)
 
         # Write FFmpeg concat list
@@ -5510,6 +5539,11 @@ def stitch_videos():
         return jsonify({"error": f"Error stitching videos: {e}"}), 500
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        for i in range(p["clip_count"]):
+            try:
+                gcs_bucket.blob(stitch_object_path(p["stitch_id"], i)).delete()
+            except Exception:
+                pass
 
 
 @app.route("/posts/<token_id>/sync-counts", methods=["POST"])
