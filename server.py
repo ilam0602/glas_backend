@@ -2088,23 +2088,56 @@ def verify_mint_worker(req) -> bool:
     return False
 
 
+def mint_upload_object_path(upload_id, index):
+    return f"mint_uploads/{upload_id}/{index}.mp4"
+
+def story_object_path(user_id, story_id):
+    return f"stories/{user_id}/{story_id}.mp4"
+
+def stitch_object_path(stitch_id, index):
+    return f"stitch_uploads/{stitch_id}/{index}.mp4"
+
+def content_length_range_header(max_bytes):
+    return {"X-Goog-Content-Length-Range": f"0,{max_bytes}"}
+
+def validate_upload_url_request(data, uid, max_bytes):
+    user_id = data.get("userId")
+    if not user_id or uid != user_id:
+        return "Missing or invalid authorization token", 401
+    if data.get("contentType") != "video/mp4":
+        return "contentType must be video/mp4", 400
+    try:
+        size = int(data.get("size", 0))
+    except (TypeError, ValueError):
+        return "size must be an integer", 400
+    if size <= 0:
+        return "size must be a positive integer", 400
+    if size > max_bytes:
+        return f"Video too large (max {max_bytes} bytes)", 413
+    return None, 200
+
 def _normalize_mint_items(data):
-    """Turn either request shape into an ordered [{image, mediaType}] list, or
-    raise ValueError with a client-facing message."""
+    """Turn either request shape into an ordered [{image, mediaType, source}]
+    list, or raise ValueError with a client-facing message. `source` is
+    'inline' (base64 in `image`) or 'gcs' (bytes already uploaded; image None)."""
+    def _one(m):
+        item_type = m.get("mediaType", "photo")
+        if item_type not in ("photo", "video"):
+            raise ValueError(f"Invalid mediaType: {item_type}")
+        if m.get("source") == "gcs":
+            return {"image": None, "mediaType": item_type, "source": "gcs"}
+        if "image" not in m:
+            raise ValueError("Each media item needs an image field")
+        return {"image": m["image"], "mediaType": item_type, "source": "inline"}
+
     if "media" in data:
         media_param = data["media"]
         if not isinstance(media_param, list) or not (1 <= len(media_param) <= 10):
             raise ValueError("media must be a list of 1-10 items")
-        items = []
-        for m in media_param:
-            if not isinstance(m, dict) or "image" not in m:
-                raise ValueError("Each media item needs an image field")
-            item_type = m.get("mediaType", "photo")
-            if item_type not in ("photo", "video"):
-                raise ValueError(f"Invalid mediaType: {item_type}")
-            items.append({"image": m["image"], "mediaType": item_type})
-        return items, True
-    return [{"image": data["image"], "mediaType": data.get("mediaType", "photo")}], False
+        return [_one(m) for m in media_param], True
+    if data.get("source") == "gcs":
+        return [{"image": None, "mediaType": data.get("mediaType", "video"), "source": "gcs"}], False
+    return [{"image": data["image"], "mediaType": data.get("mediaType", "photo"), "source": "inline"}], False
 
 
 @app.route("/mint", methods=["POST"])
