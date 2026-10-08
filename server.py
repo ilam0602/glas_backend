@@ -156,6 +156,9 @@ except Exception as e:
     gcs_bucket = None
     print(f"WARNING: GCS client init failed: {e}. HQ media upload disabled.")
 
+# Max size (bytes) accepted for client-uploaded video via /mint/upload-url.
+MAX_VIDEO_BYTES = int(os.getenv("MAX_VIDEO_BYTES", str(150 * 1024 * 1024)))
+
 # Cloud Tasks: async minting. When all TASKS_* are set, /mint/async enqueues a
 # task that calls /mint/process (so the mint survives the app closing); if not
 # set, /mint/async runs the mint inline so the app still works pre-infra.
@@ -2328,6 +2331,38 @@ def mint_async():
     return jsonify({"jobId": upload_id, "status": "queued"}), 202
 
 
+@app.route("/mint/upload-url", methods=["POST"])
+def mint_upload_url():
+    from datetime import timedelta
+    if not gcs_bucket:
+        return jsonify({"error": "Storage not configured"}), 500
+    data = request.get_json(silent=True) or {}
+    uid = verify_firebase_token(request)
+    err, status = validate_upload_url_request(data, uid, MAX_VIDEO_BYTES)
+    if err:
+        return jsonify({"error": err}), status
+
+    kind = data.get("objectKind")
+    if kind == "mint":
+        object_path = mint_upload_object_path(data["uploadId"], int(data.get("index", 0)))
+    elif kind == "story":
+        object_path = story_object_path(data["userId"], data["storyId"])
+    elif kind == "stitch":
+        object_path = stitch_object_path(data["stitchId"], int(data.get("index", 0)))
+    else:
+        return jsonify({"error": "Invalid objectKind"}), 400
+
+    required_headers = content_length_range_header(MAX_VIDEO_BYTES)
+    blob = gcs_bucket.blob(object_path)
+    upload_url = generate_signed_url(
+        blob, method="PUT", expiration=timedelta(minutes=30), headers=required_headers)
+    return jsonify({
+        "uploadUrl": upload_url,
+        "objectPath": object_path,
+        "requiredHeaders": required_headers,
+    }), 200
+
+
 @app.route("/mint/process", methods=["POST"])
 def mint_process():
     """
@@ -2406,6 +2441,31 @@ def mint_process():
     return jsonify({"status": "done", "tokenId": token_id}), 200
 
 
+def generate_signed_url(blob, method, expiration, headers=None):
+    """v4 signed URL. On Cloud Run (no key file) self-impersonate via IAM
+    signBlob; locally with a key file sign directly. `headers` are headers the
+    caller MUST send with the request (e.g. content-length-range for uploads)."""
+    import google.auth  # noqa: F401
+    from google.auth import impersonated_credentials as imp_creds
+
+    credentials = gcs_client._credentials
+    scope = "https://www.googleapis.com/auth/devstorage.read_write"
+    if not hasattr(credentials, "sign_bytes"):
+        target_principal = getattr(credentials, "service_account_email", None)
+        if not target_principal:
+            raise RuntimeError("Current GCS credentials cannot sign URLs")
+        signing_credentials = imp_creds.Credentials(
+            source_credentials=credentials,
+            target_principal=target_principal,
+            target_scopes=[scope],
+        )
+        return blob.generate_signed_url(
+            version="v4", expiration=expiration, method=method,
+            headers=headers or None, credentials=signing_credentials)
+    return blob.generate_signed_url(
+        version="v4", expiration=expiration, method=method, headers=headers or None)
+
+
 @app.route("/media/<path:blob_path>", methods=["GET", "HEAD"])
 def serve_media(blob_path):
     """
@@ -2428,34 +2488,7 @@ def serve_media(blob_path):
     # the IAM signBlob API. Locally with a key file, signs directly.
     # Ref: https://bluerider.software/presigning-gcs-urls-for-cloud-run-app-with-an-attached-service-account/
     try:
-        import google.auth
-        from google.auth import impersonated_credentials as imp_creds
-
-        credentials = gcs_client._credentials
-        if not hasattr(credentials, "sign_bytes"):
-            # Compute/metadata credentials — self-impersonate to get signing
-            target_principal = getattr(credentials, "service_account_email", None)
-            if not target_principal:
-                raise RuntimeError("Current GCS credentials cannot sign URLs locally")
-
-            signing_credentials = imp_creds.Credentials(
-                source_credentials=credentials,
-                target_principal=target_principal,
-                target_scopes=["https://www.googleapis.com/auth/devstorage.read_only"],
-            )
-            signed_url = blob.generate_signed_url(
-                version="v4",
-                expiration=timedelta(hours=1),
-                method="GET",
-                credentials=signing_credentials,
-            )
-        else:
-            # Key file credentials — sign locally
-            signed_url = blob.generate_signed_url(
-                version="v4",
-                expiration=timedelta(hours=1),
-                method="GET",
-            )
+        signed_url = generate_signed_url(blob, method="GET", expiration=timedelta(hours=1))
         return redirect(signed_url)
     except Exception as e:
         print(f"Signed URL failed, falling back to proxy: {e}")
