@@ -5361,20 +5361,20 @@ def stitch_videos():
     """
     data = request.get_json(silent=True) or {}
     try:
-        p = resolve_stitch_params(data)
+        params = resolve_stitch_params(data)
     except (ValueError, KeyError) as e:
         return jsonify({"error": str(e) or "Invalid stitch request"}), 400
 
-    user_id = p["user_id"]
-    should_mint = p["should_mint"]
-    text_overlay = p["text_overlay"]
-    text_font_size = p["text_font_size"]
-    text_color = p["text_color"]
-    is_private = p["is_private"]
-    caption = p["caption"]
-    circle_slug = p["circle_slug"]
-    collect_enabled = p["collect_enabled"]
-    collect_price = p["collect_price"]
+    user_id = params["user_id"]
+    should_mint = params["should_mint"]
+    text_overlay = params["text_overlay"]
+    text_font_size = params["text_font_size"]
+    text_color = params["text_color"]
+    is_private = params["is_private"]
+    caption = params["caption"]
+    circle_slug = params["circle_slug"]
+    collect_enabled = params["collect_enabled"]
+    collect_price = params["collect_price"]
 
     if should_mint and not user_id:
         return jsonify({"error": "userId is required when minting"}), 400
@@ -5386,8 +5386,8 @@ def stitch_videos():
         # Download clips from GCS (uploaded by the client via /mint/upload-url
         # with objectKind "stitch") into the temp directory.
         input_paths = []
-        for i in range(p["clip_count"]):
-            blob = gcs_bucket.blob(stitch_object_path(p["stitch_id"], i))
+        for i in range(params["clip_count"]):
+            blob = gcs_bucket.blob(stitch_object_path(params["stitch_id"], i))
             if not blob.exists():
                 return jsonify({"error": f"Clip {i} not found"}), 400
             path = os.path.join(tmp_dir, f"clip_{i}.mp4")
@@ -5539,9 +5539,9 @@ def stitch_videos():
         return jsonify({"error": f"Error stitching videos: {e}"}), 500
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        for i in range(p["clip_count"]):
+        for i in range(params["clip_count"]):
             try:
-                gcs_bucket.blob(stitch_object_path(p["stitch_id"], i)).delete()
+                gcs_bucket.blob(stitch_object_path(params["stitch_id"], i)).delete()
             except Exception:
                 pass
 
