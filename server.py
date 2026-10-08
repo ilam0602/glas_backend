@@ -2219,8 +2219,10 @@ def mint_async():
     running inline so the app still works before the infra is wired up.
     """
     data = request.get_json()
-    if not data or ("image" not in data and "media" not in data):
-        return jsonify({"error": "Missing image or media in request body"}), 400
+    if not data or (
+        "image" not in data and "media" not in data and data.get("source") != "gcs"
+    ):
+        return jsonify({"error": "Missing image, media, or source in request body"}), 400
 
     user_id = data.get("userId")
     is_private = data.get("isPrivate", False)
@@ -2310,6 +2312,7 @@ def mint_async():
                 "isCarousel": is_carousel,
                 "itemCount": len(items_in),
                 "itemTypes": [it["mediaType"] for it in items_in],
+                "itemSources": [it["source"] for it in items_in],
                 "createdAt": SERVER_TIMESTAMP,
             }
         )
@@ -2317,8 +2320,26 @@ def mint_async():
         return jsonify(_existing_job_response()), 200
     try:
         for i, it in enumerate(items_in):
-            _stash_mint_upload(upload_id, i, it["image"])
+            if it["source"] == "gcs":
+                blob = gcs_bucket.blob(mint_upload_object_path(upload_id, i))
+                if not blob.exists():
+                    raise ValueError(f"Uploaded video not found for item {i}")
+                if (blob.size or 0) > MAX_VIDEO_BYTES:
+                    try:
+                        blob.delete()
+                    except Exception:
+                        pass
+                    raise ValueError(f"Uploaded video too large for item {i}")
+            else:
+                _stash_mint_upload(upload_id, i, it["image"])
         enqueue_mint_job(upload_id)
+    except ValueError as e:
+        try:
+            job_ref.delete()
+        except Exception:
+            pass
+        _cleanup_mint_upload(upload_id)
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         print(f"[mint/async] enqueue failed: {e}")
         # Roll back so a retry can cleanly re-create the job.
