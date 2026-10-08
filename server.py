@@ -2121,6 +2121,8 @@ def _normalize_mint_items(data):
     list, or raise ValueError with a client-facing message. `source` is
     'inline' (base64 in `image`) or 'gcs' (bytes already uploaded; image None)."""
     def _one(m):
+        if not isinstance(m, dict):
+            raise ValueError("Each media item must be an object")
         item_type = m.get("mediaType", "photo")
         if item_type not in ("photo", "video"):
             raise ValueError(f"Invalid mediaType: {item_type}")

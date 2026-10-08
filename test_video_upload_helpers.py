@@ -46,3 +46,8 @@ def test_normalize_media_item_gcs_needs_no_image():
     items, carousel = _normalize_mint_items({"media": [{"source": "gcs", "mediaType": "video"}]})
     assert items == [{"image": None, "mediaType": "video", "source": "gcs"}]
     assert carousel is True
+
+def test_normalize_rejects_non_dict_media_item():
+    import pytest
+    with pytest.raises(ValueError):
+        _normalize_mint_items({"media": ["not-a-dict"]})
