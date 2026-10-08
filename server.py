@@ -3192,6 +3192,58 @@ def mint_story_nft_background(story_id, user_id, media_b64, media_type):
         print(f"Story mint failed for {story_id} (story remains ephemeral): {e}")
 
 
+def _story_upload_from_gcs(data):
+    """
+    GCS variant of /story-upload: the client has already uploaded the
+    (pre-compressed) story video to stories/{userId}/{storyId}.mp4 via
+    /mint/upload-url (objectKind "story"), so this skips the base64 decode
+    and server-side compress_video -- it only needs to run moderation on
+    the real bytes and kick off the same background mint used by the
+    base64 path. Response shape matches the existing endpoint exactly.
+    """
+    user_id = data.get("userId")
+    story_id = data.get("storyId")
+    media_type = data.get("mediaType", "video")
+
+    uid = verify_firebase_token(request)
+    if not uid or uid != user_id:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not gcs_bucket:
+        return jsonify({"error": "Storage not configured"}), 500
+
+    blob = gcs_bucket.blob(story_object_path(user_id, story_id))
+    if not blob.exists():
+        return jsonify({"error": "Uploaded story not found"}), 400
+
+    hq_bytes = blob.download_as_bytes()
+    analysis = analyze_video(hq_bytes)
+    media_path = f"/media/{story_object_path(user_id, story_id)}"
+
+    # Fire-and-forget NFT mint, matching the base64 path below: flagged
+    # content is still minted (marked flagged/pending for moderation
+    # review) rather than deleted -- see mint_story_nft_background and the
+    # analogous /mint flow (server.py save_post_server), neither of which
+    # delete media on a flag.
+    threading.Thread(
+        target=mint_story_nft_background,
+        args=(
+            story_id,
+            user_id,
+            base64.b64encode(hq_bytes).decode("utf-8"),
+            media_type,
+        ),
+        daemon=True,
+    ).start()
+
+    return jsonify({
+        "storyId": story_id,
+        "mediaPath": media_path,
+        "mediaType": media_type,
+        "flagged": analysis.get("flagged", False),
+        "flagReason": analysis.get("reason", ""),
+    })
+
+
 @app.route("/story-upload", methods=["POST"])
 def story_upload():
     """
@@ -3199,8 +3251,14 @@ def story_upload():
     Body: { image: <base64>, userId, mediaType: "photo"|"video" }
     No IPFS pin, no NFT mint -- stories are not minted.
     Returns { storyId, mediaPath, mediaType, flagged, flagReason }.
+
+    Also accepts the GCS variant: { storyId, userId, mediaType: "video",
+    source: "gcs" } for media the client already uploaded directly to GCS
+    via /mint/upload-url (objectKind "story") -- see _story_upload_from_gcs.
     """
     data = request.get_json()
+    if data and data.get("source") == "gcs":
+        return _story_upload_from_gcs(data)
     if not data or "image" not in data or "userId" not in data:
         return jsonify({"error": "Missing image or userId in request body"}), 400
 
