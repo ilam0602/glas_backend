@@ -1620,17 +1620,35 @@ def send_contract_transaction(fn_call, gas_limit):
     Thread-safe get_nonce() + build_transaction + send_transaction for a bound
     contract function (e.g. contract.functions.mintToVirtual(hash, uri)).
     Returns (tx_hash, receipt). Raises on failure, like send_transaction.
+
+    `gas_limit` is treated as a FLOOR. We estimate the real gas cost on-chain and
+    use max(estimate * buffer, gas_limit). The hardcoded floors used to be sent
+    verbatim, so when a function's real cost grew past them (e.g. mintToVirtual
+    now needs ~1.5M gas vs the old 500k floor) the tx ran out of gas and reverted
+    with status 0 and no logs -- which surfaced downstream as misleading errors
+    like "No VirtualMint event found in receipt".
     """
     with tx_lock:
         nonce = get_nonce()
         max_fee, max_priority_fee = get_gas_params()
+
+        # Estimate real gas and add a 30% buffer; fall back to the floor if the
+        # node can't estimate (the subsequent send will surface the real error).
+        try:
+            estimated = fn_call.estimate_gas({"from": account.address})
+            gas = max(int(estimated * 1.3), gas_limit)
+            print(f"  estimated gas: {estimated} -> using {gas} (floor {gas_limit})")
+        except Exception as e:
+            gas = gas_limit
+            print(f"  gas estimate failed ({e}); falling back to floor {gas_limit}")
+
         print(f"Building transaction with nonce: {nonce}")
         print(f"  max_fee: {w3.from_wei(max_fee, 'gwei'):.2f} gwei")
         print(f"  max_priority_fee: {w3.from_wei(max_priority_fee, 'gwei'):.2f} gwei")
         txn = fn_call.build_transaction(
             {
                 "chainId": w3.eth.chain_id,
-                "gas": gas_limit,
+                "gas": gas,
                 "maxFeePerGas": max_fee,
                 "maxPriorityFeePerGas": max_priority_fee,
                 "nonce": nonce,
