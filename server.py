@@ -1165,12 +1165,15 @@ def get_video_duration_seconds(video_bytes):
                 pass
 
 
-def process_mint_media_item(base64_data, media_type, is_private=False):
+def process_mint_media_item(item, media_type, is_private=False):
     """
     Compress one media item (720p for IPFS, 1080p for GCS HQ), pin the 720p
     version to Pinata, and run AI moderation on it. Returns a dict consumed
     by /mint. Raises if the Pinata upload fails; compression failures fall
     back to the original bytes (same behavior as the old single-media path).
+
+    `item` is {"image": <base64>} for inline items, or {"raw_bytes": <bytes>}
+    for items already fetched from GCS (no base64 round-trip needed).
 
     PUBLIC posts (is_private=False) are unchanged: the 720p derivative is pinned to
     public IPFS. PRIVATE posts skip the public IPFS pin entirely (ipfs_url is None) so
@@ -1178,7 +1181,11 @@ def process_mint_media_item(base64_data, media_type, is_private=False):
     is served only from access-controlled cloud storage (the 1080p GCS copy) via the
     /unlock-post endpoint.
     """
-    raw_bytes = base64.b64decode(base64_data)
+    base64_data = item.get("image")
+    raw_bytes = (
+        item["raw_bytes"] if item.get("raw_bytes") is not None
+        else base64.b64decode(base64_data)
+    )
 
     duration_seconds = None
     if media_type == "video":
@@ -1199,7 +1206,12 @@ def process_mint_media_item(base64_data, media_type, is_private=False):
             hq_bytes = base64.b64decode(hq_base64)
     except Exception as e:
         print(f"Compression failed, using original: {e}")
-        lq_base64 = base64_data
+        # base64_data is None for raw_bytes-sourced (GCS) items — fall back to
+        # encoding the original bytes instead of pinning `None` to IPFS.
+        lq_base64 = (
+            base64_data if base64_data is not None
+            else base64.b64encode(raw_bytes).decode("utf-8")
+        )
         hq_bytes = raw_bytes
 
     if is_private:
@@ -1742,7 +1754,7 @@ def run_mint_pipeline(items_in, user_id, wallet_address, is_private, is_carousel
     for index, item in enumerate(items_in):
         try:
             processed.append(
-                process_mint_media_item(item["image"], item["mediaType"], is_private)
+                process_mint_media_item(item, item["mediaType"], is_private)
             )
         except Exception as e:
             print(f"Item {index} Pinata upload failed: {e}")
@@ -2210,6 +2222,34 @@ def mint_nft():
     return jsonify(response_data)
 
 
+class _GcsNotConfiguredError(Exception):
+    """Raised by _resolve_inline_fallback_items when a gcs-sourced item needs
+    bucket access that isn't available (503, distinct from a bad upload)."""
+
+
+def _resolve_inline_fallback_items(items_in, upload_id):
+    """The /mint/async inline fallback calls run_mint_pipeline directly (no
+    Cloud Tasks worker reads the GCS upload for it). gcs-sourced items arrive
+    with image=None, so swap each one for raw_bytes fetched straight from the
+    bucket before the pipeline sees it. Inline items pass through unchanged.
+    Raises _GcsNotConfiguredError if gcs_bucket is unavailable (can't read
+    bytes at all) or ValueError for a missing/oversized blob."""
+    resolved = []
+    for i, it in enumerate(items_in):
+        if it.get("source") != "gcs":
+            resolved.append({"image": it["image"], "mediaType": it["mediaType"]})
+            continue
+        if not gcs_bucket:
+            raise _GcsNotConfiguredError("Storage not configured for video")
+        blob = gcs_bucket.blob(mint_upload_object_path(upload_id, i))
+        if not blob.exists():
+            raise ValueError(f"Uploaded video not found for item {i}")
+        if (blob.size or 0) > MAX_VIDEO_BYTES:
+            raise ValueError(f"Uploaded video too large for item {i}")
+        resolved.append({"raw_bytes": blob.download_as_bytes(), "mediaType": it["mediaType"]})
+    return resolved
+
+
 @app.route("/mint/async", methods=["POST"])
 def mint_async():
     """
@@ -2277,6 +2317,14 @@ def mint_async():
             )
         except AlreadyExists:
             return jsonify(_existing_job_response()), 200
+        try:
+            items_in = _resolve_inline_fallback_items(items_in, upload_id)
+        except _GcsNotConfiguredError as e:
+            job_ref.update({"status": "failed", "error": str(e)})
+            return jsonify({"error": str(e)}), 503
+        except ValueError as e:
+            job_ref.update({"status": "failed", "error": str(e)})
+            return jsonify({"error": str(e)}), 400
         try:
             response_data = run_mint_pipeline(
                 items_in, user_id, None, is_private, is_carousel
@@ -2384,6 +2432,23 @@ def mint_upload_url():
     }), 200
 
 
+def build_mint_items(job, download_bytes, read_b64):
+    """Build the pipeline's item list from a job doc. gcs items carry raw_bytes;
+    inline items carry base64 image. `download_bytes(i)` / `read_b64(i)` fetch
+    the payload for item i."""
+    count = job.get("itemCount", 1)
+    types = job.get("itemTypes", ["photo"])
+    sources = job.get("itemSources", ["inline"] * count)
+    items = []
+    for i in range(count):
+        mtype = types[i] if i < len(types) else "photo"
+        if (sources[i] if i < len(sources) else "inline") == "gcs":
+            items.append({"raw_bytes": download_bytes(i), "mediaType": mtype})
+        else:
+            items.append({"image": read_b64(i), "mediaType": mtype})
+    return items
+
+
 @app.route("/mint/process", methods=["POST"])
 def mint_process():
     """
@@ -2429,15 +2494,14 @@ def mint_process():
     collect_enabled = job.get("collectEnabled", True)
     collect_price = job.get("collectPrice", DEFAULT_COLLECT_PRICE)
     is_carousel = job.get("isCarousel", False)
-    item_count = job.get("itemCount", 1)
-    item_types = job.get("itemTypes", ["photo"])
 
     try:
-        items_in = []
-        for i in range(item_count):
-            b64 = _read_mint_upload(job_id, i)
-            mtype = item_types[i] if i < len(item_types) else "photo"
-            items_in.append({"image": b64, "mediaType": mtype})
+        items_in = build_mint_items(
+            job,
+            download_bytes=lambda i: gcs_bucket.blob(
+                mint_upload_object_path(job_id, i)).download_as_bytes(),
+            read_b64=lambda i: _read_mint_upload(job_id, i),
+        )
         response_data = run_mint_pipeline(
             items_in, user_id, None, is_private, is_carousel
         )
