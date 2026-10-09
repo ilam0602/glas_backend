@@ -156,6 +156,9 @@ except Exception as e:
     gcs_bucket = None
     print(f"WARNING: GCS client init failed: {e}. HQ media upload disabled.")
 
+# Max size (bytes) accepted for client-uploaded video via /mint/upload-url.
+MAX_VIDEO_BYTES = int(os.getenv("MAX_VIDEO_BYTES", str(150 * 1024 * 1024)))
+
 # Cloud Tasks: async minting. When all TASKS_* are set, /mint/async enqueues a
 # task that calls /mint/process (so the mint survives the app closing); if not
 # set, /mint/async runs the mint inline so the app still works pre-infra.
@@ -1162,12 +1165,15 @@ def get_video_duration_seconds(video_bytes):
                 pass
 
 
-def process_mint_media_item(base64_data, media_type, is_private=False):
+def process_mint_media_item(item, media_type, is_private=False):
     """
     Compress one media item (720p for IPFS, 1080p for GCS HQ), pin the 720p
     version to Pinata, and run AI moderation on it. Returns a dict consumed
     by /mint. Raises if the Pinata upload fails; compression failures fall
     back to the original bytes (same behavior as the old single-media path).
+
+    `item` is {"image": <base64>} for inline items, or {"raw_bytes": <bytes>}
+    for items already fetched from GCS (no base64 round-trip needed).
 
     PUBLIC posts (is_private=False) are unchanged: the 720p derivative is pinned to
     public IPFS. PRIVATE posts skip the public IPFS pin entirely (ipfs_url is None) so
@@ -1175,7 +1181,11 @@ def process_mint_media_item(base64_data, media_type, is_private=False):
     is served only from access-controlled cloud storage (the 1080p GCS copy) via the
     /unlock-post endpoint.
     """
-    raw_bytes = base64.b64decode(base64_data)
+    base64_data = item.get("image")
+    raw_bytes = (
+        item["raw_bytes"] if item.get("raw_bytes") is not None
+        else base64.b64decode(base64_data)
+    )
 
     duration_seconds = None
     if media_type == "video":
@@ -1196,7 +1206,12 @@ def process_mint_media_item(base64_data, media_type, is_private=False):
             hq_bytes = base64.b64decode(hq_base64)
     except Exception as e:
         print(f"Compression failed, using original: {e}")
-        lq_base64 = base64_data
+        # base64_data is None for raw_bytes-sourced (GCS) items — fall back to
+        # encoding the original bytes instead of pinning `None` to IPFS.
+        lq_base64 = (
+            base64_data if base64_data is not None
+            else base64.b64encode(raw_bytes).decode("utf-8")
+        )
         hq_bytes = raw_bytes
 
     if is_private:
@@ -1605,17 +1620,35 @@ def send_contract_transaction(fn_call, gas_limit):
     Thread-safe get_nonce() + build_transaction + send_transaction for a bound
     contract function (e.g. contract.functions.mintToVirtual(hash, uri)).
     Returns (tx_hash, receipt). Raises on failure, like send_transaction.
+
+    `gas_limit` is treated as a FLOOR. We estimate the real gas cost on-chain and
+    use max(estimate * buffer, gas_limit). The hardcoded floors used to be sent
+    verbatim, so when a function's real cost grew past them (e.g. mintToVirtual
+    now needs ~1.5M gas vs the old 500k floor) the tx ran out of gas and reverted
+    with status 0 and no logs -- which surfaced downstream as misleading errors
+    like "No VirtualMint event found in receipt".
     """
     with tx_lock:
         nonce = get_nonce()
         max_fee, max_priority_fee = get_gas_params()
+
+        # Estimate real gas and add a 30% buffer; fall back to the floor if the
+        # node can't estimate (the subsequent send will surface the real error).
+        try:
+            estimated = fn_call.estimate_gas({"from": account.address})
+            gas = max(int(estimated * 1.3), gas_limit)
+            print(f"  estimated gas: {estimated} -> using {gas} (floor {gas_limit})")
+        except Exception as e:
+            gas = gas_limit
+            print(f"  gas estimate failed ({e}); falling back to floor {gas_limit}")
+
         print(f"Building transaction with nonce: {nonce}")
         print(f"  max_fee: {w3.from_wei(max_fee, 'gwei'):.2f} gwei")
         print(f"  max_priority_fee: {w3.from_wei(max_priority_fee, 'gwei'):.2f} gwei")
         txn = fn_call.build_transaction(
             {
                 "chainId": w3.eth.chain_id,
-                "gas": gas_limit,
+                "gas": gas,
                 "maxFeePerGas": max_fee,
                 "maxPriorityFeePerGas": max_priority_fee,
                 "nonce": nonce,
@@ -1739,7 +1772,7 @@ def run_mint_pipeline(items_in, user_id, wallet_address, is_private, is_carousel
     for index, item in enumerate(items_in):
         try:
             processed.append(
-                process_mint_media_item(item["image"], item["mediaType"], is_private)
+                process_mint_media_item(item, item["mediaType"], is_private)
             )
         except Exception as e:
             print(f"Item {index} Pinata upload failed: {e}")
@@ -2088,23 +2121,58 @@ def verify_mint_worker(req) -> bool:
     return False
 
 
+def mint_upload_object_path(upload_id, index):
+    return f"mint_uploads/{upload_id}/{index}.mp4"
+
+def story_object_path(user_id, story_id):
+    return f"stories/{user_id}/{story_id}.mp4"
+
+def stitch_object_path(stitch_id, index):
+    return f"stitch_uploads/{stitch_id}/{index}.mp4"
+
+def content_length_range_header(max_bytes):
+    return {"X-Goog-Content-Length-Range": f"0,{max_bytes}"}
+
+def validate_upload_url_request(data, uid, max_bytes):
+    user_id = data.get("userId")
+    if not user_id or uid != user_id:
+        return "Missing or invalid authorization token", 401
+    if data.get("contentType") != "video/mp4":
+        return "contentType must be video/mp4", 400
+    try:
+        size = int(data.get("size", 0))
+    except (TypeError, ValueError):
+        return "size must be an integer", 400
+    if size <= 0:
+        return "size must be a positive integer", 400
+    if size > max_bytes:
+        return f"Video too large (max {max_bytes} bytes)", 413
+    return None, 200
+
 def _normalize_mint_items(data):
-    """Turn either request shape into an ordered [{image, mediaType}] list, or
-    raise ValueError with a client-facing message."""
+    """Turn either request shape into an ordered [{image, mediaType, source}]
+    list, or raise ValueError with a client-facing message. `source` is
+    'inline' (base64 in `image`) or 'gcs' (bytes already uploaded; image None)."""
+    def _one(m):
+        if not isinstance(m, dict):
+            raise ValueError("Each media item must be an object")
+        item_type = m.get("mediaType", "photo")
+        if item_type not in ("photo", "video"):
+            raise ValueError(f"Invalid mediaType: {item_type}")
+        if m.get("source") == "gcs":
+            return {"image": None, "mediaType": item_type, "source": "gcs"}
+        if "image" not in m:
+            raise ValueError("Each media item needs an image field")
+        return {"image": m["image"], "mediaType": item_type, "source": "inline"}
+
     if "media" in data:
         media_param = data["media"]
         if not isinstance(media_param, list) or not (1 <= len(media_param) <= 10):
             raise ValueError("media must be a list of 1-10 items")
-        items = []
-        for m in media_param:
-            if not isinstance(m, dict) or "image" not in m:
-                raise ValueError("Each media item needs an image field")
-            item_type = m.get("mediaType", "photo")
-            if item_type not in ("photo", "video"):
-                raise ValueError(f"Invalid mediaType: {item_type}")
-            items.append({"image": m["image"], "mediaType": item_type})
-        return items, True
-    return [{"image": data["image"], "mediaType": data.get("mediaType", "photo")}], False
+        return [_one(m) for m in media_param], True
+    if data.get("source") == "gcs":
+        return [{"image": None, "mediaType": data.get("mediaType", "video"), "source": "gcs"}], False
+    return [{"image": data["image"], "mediaType": data.get("mediaType", "photo"), "source": "inline"}], False
 
 
 @app.route("/mint", methods=["POST"])
@@ -2172,6 +2240,34 @@ def mint_nft():
     return jsonify(response_data)
 
 
+class _GcsNotConfiguredError(Exception):
+    """Raised by _resolve_inline_fallback_items when a gcs-sourced item needs
+    bucket access that isn't available (503, distinct from a bad upload)."""
+
+
+def _resolve_inline_fallback_items(items_in, upload_id):
+    """The /mint/async inline fallback calls run_mint_pipeline directly (no
+    Cloud Tasks worker reads the GCS upload for it). gcs-sourced items arrive
+    with image=None, so swap each one for raw_bytes fetched straight from the
+    bucket before the pipeline sees it. Inline items pass through unchanged.
+    Raises _GcsNotConfiguredError if gcs_bucket is unavailable (can't read
+    bytes at all) or ValueError for a missing/oversized blob."""
+    resolved = []
+    for i, it in enumerate(items_in):
+        if it.get("source") != "gcs":
+            resolved.append({"image": it["image"], "mediaType": it["mediaType"]})
+            continue
+        if not gcs_bucket:
+            raise _GcsNotConfiguredError("Storage not configured for video")
+        blob = gcs_bucket.blob(mint_upload_object_path(upload_id, i))
+        if not blob.exists():
+            raise ValueError(f"Uploaded video not found for item {i}")
+        if (blob.size or 0) > MAX_VIDEO_BYTES:
+            raise ValueError(f"Uploaded video too large for item {i}")
+        resolved.append({"raw_bytes": blob.download_as_bytes(), "mediaType": it["mediaType"]})
+    return resolved
+
+
 @app.route("/mint/async", methods=["POST"])
 def mint_async():
     """
@@ -2181,8 +2277,10 @@ def mint_async():
     running inline so the app still works before the infra is wired up.
     """
     data = request.get_json()
-    if not data or ("image" not in data and "media" not in data):
-        return jsonify({"error": "Missing image or media in request body"}), 400
+    if not data or (
+        "image" not in data and "media" not in data and data.get("source") != "gcs"
+    ):
+        return jsonify({"error": "Missing image, media, or source in request body"}), 400
 
     user_id = data.get("userId")
     is_private = data.get("isPrivate", False)
@@ -2238,11 +2336,22 @@ def mint_async():
         except AlreadyExists:
             return jsonify(_existing_job_response()), 200
         try:
+            items_in = _resolve_inline_fallback_items(items_in, upload_id)
+        except _GcsNotConfiguredError as e:
+            job_ref.update({"status": "failed", "error": str(e)})
+            _cleanup_mint_upload(upload_id)
+            return jsonify({"error": str(e)}), 503
+        except ValueError as e:
+            job_ref.update({"status": "failed", "error": str(e)})
+            _cleanup_mint_upload(upload_id)
+            return jsonify({"error": str(e)}), 400
+        try:
             response_data = run_mint_pipeline(
                 items_in, user_id, None, is_private, is_carousel
             )
         except MintError as e:
             job_ref.update({"status": "failed", "error": str(e)})
+            _cleanup_mint_upload(upload_id)
             return jsonify({"error": str(e)}), 500
         token_id = response_data["token_id"]
         save_post_server(
@@ -2253,6 +2362,7 @@ def mint_async():
         job_ref.update(
             {"status": "done", "tokenId": token_id, "finishedAt": SERVER_TIMESTAMP}
         )
+        _cleanup_mint_upload(upload_id)
         return (
             jsonify({"jobId": upload_id, "status": "done", "token_id": token_id}),
             200,
@@ -2272,6 +2382,7 @@ def mint_async():
                 "isCarousel": is_carousel,
                 "itemCount": len(items_in),
                 "itemTypes": [it["mediaType"] for it in items_in],
+                "itemSources": [it["source"] for it in items_in],
                 "createdAt": SERVER_TIMESTAMP,
             }
         )
@@ -2279,8 +2390,26 @@ def mint_async():
         return jsonify(_existing_job_response()), 200
     try:
         for i, it in enumerate(items_in):
-            _stash_mint_upload(upload_id, i, it["image"])
+            if it["source"] == "gcs":
+                blob = gcs_bucket.blob(mint_upload_object_path(upload_id, i))
+                if not blob.exists():
+                    raise ValueError(f"Uploaded video not found for item {i}")
+                if (blob.size or 0) > MAX_VIDEO_BYTES:
+                    try:
+                        blob.delete()
+                    except Exception:
+                        pass
+                    raise ValueError(f"Uploaded video too large for item {i}")
+            else:
+                _stash_mint_upload(upload_id, i, it["image"])
         enqueue_mint_job(upload_id)
+    except ValueError as e:
+        try:
+            job_ref.delete()
+        except Exception:
+            pass
+        _cleanup_mint_upload(upload_id)
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         print(f"[mint/async] enqueue failed: {e}")
         # Roll back so a retry can cleanly re-create the job.
@@ -2291,6 +2420,64 @@ def mint_async():
         _cleanup_mint_upload(upload_id)
         return jsonify({"error": f"Could not queue upload: {e}"}), 500
     return jsonify({"jobId": upload_id, "status": "queued"}), 202
+
+
+@app.route("/mint/upload-url", methods=["POST"])
+def mint_upload_url():
+    from datetime import timedelta
+    if not gcs_bucket:
+        return jsonify({"error": "Storage not configured"}), 500
+    data = request.get_json(silent=True) or {}
+    uid = verify_firebase_token(request)
+    err, status = validate_upload_url_request(data, uid, MAX_VIDEO_BYTES)
+    if err:
+        return jsonify({"error": err}), status
+
+    kind = data.get("objectKind")
+    try:
+        if kind == "mint":
+            object_path = mint_upload_object_path(data["uploadId"], int(data.get("index", 0)))
+        elif kind == "story":
+            object_path = story_object_path(data["userId"], data["storyId"])
+        elif kind == "stitch":
+            object_path = stitch_object_path(data["stitchId"], int(data.get("index", 0)))
+        else:
+            return jsonify({"error": "Invalid objectKind"}), 400
+    except KeyError as e:
+        return jsonify({"error": f"missing {e.args[0]} for objectKind {kind}"}), 400
+    except (TypeError, ValueError):
+        return jsonify({"error": f"invalid index for objectKind {kind}"}), 400
+
+    required_headers = content_length_range_header(MAX_VIDEO_BYTES)
+    blob = gcs_bucket.blob(object_path)
+    try:
+        upload_url = generate_signed_url(
+            blob, method="PUT", expiration=timedelta(minutes=30), headers=required_headers)
+    except Exception as e:
+        print(f"[mint/upload-url] signing failed: {e}")
+        return jsonify({"error": "Could not generate upload URL"}), 500
+    return jsonify({
+        "uploadUrl": upload_url,
+        "objectPath": object_path,
+        "requiredHeaders": required_headers,
+    }), 200
+
+
+def build_mint_items(job, download_bytes, read_b64):
+    """Build the pipeline's item list from a job doc. gcs items carry raw_bytes;
+    inline items carry base64 image. `download_bytes(i)` / `read_b64(i)` fetch
+    the payload for item i."""
+    count = job.get("itemCount", 1)
+    types = job.get("itemTypes", ["photo"])
+    sources = job.get("itemSources", ["inline"] * count)
+    items = []
+    for i in range(count):
+        mtype = types[i] if i < len(types) else "photo"
+        if (sources[i] if i < len(sources) else "inline") == "gcs":
+            items.append({"raw_bytes": download_bytes(i), "mediaType": mtype})
+        else:
+            items.append({"image": read_b64(i), "mediaType": mtype})
+    return items
 
 
 @app.route("/mint/process", methods=["POST"])
@@ -2338,15 +2525,14 @@ def mint_process():
     collect_enabled = job.get("collectEnabled", True)
     collect_price = job.get("collectPrice", DEFAULT_COLLECT_PRICE)
     is_carousel = job.get("isCarousel", False)
-    item_count = job.get("itemCount", 1)
-    item_types = job.get("itemTypes", ["photo"])
 
     try:
-        items_in = []
-        for i in range(item_count):
-            b64 = _read_mint_upload(job_id, i)
-            mtype = item_types[i] if i < len(item_types) else "photo"
-            items_in.append({"image": b64, "mediaType": mtype})
+        items_in = build_mint_items(
+            job,
+            download_bytes=lambda i: gcs_bucket.blob(
+                mint_upload_object_path(job_id, i)).download_as_bytes(),
+            read_b64=lambda i: _read_mint_upload(job_id, i),
+        )
         response_data = run_mint_pipeline(
             items_in, user_id, None, is_private, is_carousel
         )
@@ -2371,6 +2557,31 @@ def mint_process():
     return jsonify({"status": "done", "tokenId": token_id}), 200
 
 
+def generate_signed_url(blob, method, expiration, headers=None):
+    """v4 signed URL. On Cloud Run (no key file) self-impersonate via IAM
+    signBlob; locally with a key file sign directly. `headers` are headers the
+    caller MUST send with the request (e.g. content-length-range for uploads)."""
+    import google.auth  # noqa: F401
+    from google.auth import impersonated_credentials as imp_creds
+
+    credentials = gcs_client._credentials
+    scope = "https://www.googleapis.com/auth/devstorage.read_write"
+    if not hasattr(credentials, "sign_bytes"):
+        target_principal = getattr(credentials, "service_account_email", None)
+        if not target_principal:
+            raise RuntimeError("Current GCS credentials cannot sign URLs")
+        signing_credentials = imp_creds.Credentials(
+            source_credentials=credentials,
+            target_principal=target_principal,
+            target_scopes=[scope],
+        )
+        return blob.generate_signed_url(
+            version="v4", expiration=expiration, method=method,
+            headers=headers or None, credentials=signing_credentials)
+    return blob.generate_signed_url(
+        version="v4", expiration=expiration, method=method, headers=headers or None)
+
+
 @app.route("/media/<path:blob_path>", methods=["GET", "HEAD"])
 def serve_media(blob_path):
     """
@@ -2393,34 +2604,7 @@ def serve_media(blob_path):
     # the IAM signBlob API. Locally with a key file, signs directly.
     # Ref: https://bluerider.software/presigning-gcs-urls-for-cloud-run-app-with-an-attached-service-account/
     try:
-        import google.auth
-        from google.auth import impersonated_credentials as imp_creds
-
-        credentials = gcs_client._credentials
-        if not hasattr(credentials, "sign_bytes"):
-            # Compute/metadata credentials — self-impersonate to get signing
-            target_principal = getattr(credentials, "service_account_email", None)
-            if not target_principal:
-                raise RuntimeError("Current GCS credentials cannot sign URLs locally")
-
-            signing_credentials = imp_creds.Credentials(
-                source_credentials=credentials,
-                target_principal=target_principal,
-                target_scopes=["https://www.googleapis.com/auth/devstorage.read_only"],
-            )
-            signed_url = blob.generate_signed_url(
-                version="v4",
-                expiration=timedelta(hours=1),
-                method="GET",
-                credentials=signing_credentials,
-            )
-        else:
-            # Key file credentials — sign locally
-            signed_url = blob.generate_signed_url(
-                version="v4",
-                expiration=timedelta(hours=1),
-                method="GET",
-            )
+        signed_url = generate_signed_url(blob, method="GET", expiration=timedelta(hours=1))
         return redirect(signed_url)
     except Exception as e:
         print(f"Signed URL failed, falling back to proxy: {e}")
@@ -3021,6 +3205,58 @@ def mint_story_nft_background(story_id, user_id, media_b64, media_type):
         print(f"Story mint failed for {story_id} (story remains ephemeral): {e}")
 
 
+def _story_upload_from_gcs(data):
+    """
+    GCS variant of /story-upload: the client has already uploaded the
+    (pre-compressed) story video to stories/{userId}/{storyId}.mp4 via
+    /mint/upload-url (objectKind "story"), so this skips the base64 decode
+    and server-side compress_video -- it only needs to run moderation on
+    the real bytes and kick off the same background mint used by the
+    base64 path. Response shape matches the existing endpoint exactly.
+    """
+    user_id = data.get("userId")
+    story_id = data.get("storyId")
+    media_type = data.get("mediaType", "video")
+
+    uid = verify_firebase_token(request)
+    if not uid or uid != user_id:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not gcs_bucket:
+        return jsonify({"error": "Storage not configured"}), 500
+
+    blob = gcs_bucket.blob(story_object_path(user_id, story_id))
+    if not blob.exists():
+        return jsonify({"error": "Uploaded story not found"}), 400
+
+    hq_bytes = blob.download_as_bytes()
+    analysis = analyze_video(hq_bytes)
+    media_path = f"/media/{story_object_path(user_id, story_id)}"
+
+    # Fire-and-forget NFT mint, matching the base64 path below: flagged
+    # content is still minted (marked flagged/pending for moderation
+    # review) rather than deleted -- see mint_story_nft_background and the
+    # analogous /mint flow (server.py save_post_server), neither of which
+    # delete media on a flag.
+    threading.Thread(
+        target=mint_story_nft_background,
+        args=(
+            story_id,
+            user_id,
+            base64.b64encode(hq_bytes).decode("utf-8"),
+            media_type,
+        ),
+        daemon=True,
+    ).start()
+
+    return jsonify({
+        "storyId": story_id,
+        "mediaPath": media_path,
+        "mediaType": media_type,
+        "flagged": analysis.get("flagged", False),
+        "flagReason": analysis.get("reason", ""),
+    })
+
+
 @app.route("/story-upload", methods=["POST"])
 def story_upload():
     """
@@ -3028,8 +3264,14 @@ def story_upload():
     Body: { image: <base64>, userId, mediaType: "photo"|"video" }
     No IPFS pin, no NFT mint -- stories are not minted.
     Returns { storyId, mediaPath, mediaType, flagged, flagReason }.
+
+    Also accepts the GCS variant: { storyId, userId, mediaType: "video",
+    source: "gcs" } for media the client already uploaded directly to GCS
+    via /mint/upload-url (objectKind "story") -- see _story_upload_from_gcs.
     """
     data = request.get_json()
+    if data and data.get("source") == "gcs":
+        return _story_upload_from_gcs(data)
     if not data or "image" not in data or "userId" not in data:
         return jsonify({"error": "Missing image or userId in request body"}), 400
 
@@ -5090,50 +5332,83 @@ def delete_account():
     return jsonify({"deleted": True, "errors": errors})
 
 
+def resolve_stitch_params(data):
+    """Parse stitch params from a JSON (GCS-reference) request body."""
+    clip_count = int(data.get("clipCount", 0))
+    if clip_count < 2:
+        raise ValueError("At least 2 video clips are required")
+    collect_price_raw = data.get("collectPrice", "")
+    try:
+        collect_price = float(collect_price_raw) if collect_price_raw not in ("", None) else None
+    except (ValueError, TypeError):
+        collect_price = None
+    return {
+        "stitch_id": data["stitchId"],
+        "clip_count": clip_count,
+        "user_id": data.get("userId"),
+        "should_mint": str(data.get("mint", "true")).lower() == "true",
+        "text_overlay": (data.get("textOverlay") or "").strip(),
+        "text_font_size": str(data.get("textFontSize", "48")),
+        "text_color": data.get("textColor", "white"),
+        "is_private": bool(data.get("isPrivate", False)),
+        "caption": (data.get("caption") or "").strip() or None,
+        "circle_slug": (data.get("circleSlug") or "").strip() or None,
+        "collect_enabled": str(data.get("collectEnabled", "true")).lower() != "false",
+        "collect_price": collect_price,
+    }
+
+
 @app.route("/stitch", methods=["POST"])
 def stitch_videos():
     """
-    POST endpoint that accepts multipart form-data with:
-      - videos[]: multiple video files
+    POST endpoint that accepts a JSON body referencing clips already uploaded to GCS:
+      - stitchId: id used to locate uploaded clips at stitch_uploads/{stitchId}/{i}.mp4
+      - clipCount: number of clips (>= 2)
       - userId: Firebase user ID
       - mint: "true" or "false" (optional, default "true")
-      - text_overlay: optional text to burn into the video (static, full duration)
-      - text_font_size: optional font size for overlay (default 48)
-      - text_color: optional color for overlay (default "white")
+      - textOverlay: optional text to burn into the video (static, full duration)
+      - textFontSize: optional font size for overlay (default 48)
+      - textColor: optional color for overlay (default "white")
 
     Stitches videos with FFmpeg concat, optionally mints the result as an NFT.
     """
-    uploaded_files = request.files.getlist("videos[]")
-    user_id = request.form.get("userId")
-    should_mint = request.form.get("mint", "true").lower() == "true"
-    text_overlay = request.form.get("text_overlay", "").strip()
-    text_font_size = request.form.get("text_font_size", "48")
-    text_color = request.form.get("text_color", "white")
-    # Post metadata: the server writes the posts/{id} doc itself (client no longer
-    # calls savePost), so rankScore/moderation/userId can't be forged from the client.
-    is_private = request.form.get("isPrivate", "false").lower() == "true"
-    caption = request.form.get("caption", "").strip() or None
-    circle_slug = request.form.get("circleSlug", "").strip() or None
-    collect_enabled = request.form.get("collectEnabled", "true").lower() != "false"
-    _collect_price_raw = request.form.get("collectPrice", "")
+    data = request.get_json(silent=True) or {}
     try:
-        collect_price = float(_collect_price_raw) if _collect_price_raw != "" else None
-    except ValueError:
-        collect_price = None
+        params = resolve_stitch_params(data)
+    except (ValueError, KeyError) as e:
+        return jsonify({"error": str(e) or "Invalid stitch request"}), 400
 
-    if not uploaded_files or len(uploaded_files) < 2:
-        return jsonify({"error": "At least 2 video files are required"}), 400
+    user_id = params["user_id"]
+    should_mint = params["should_mint"]
+    text_overlay = params["text_overlay"]
+    text_font_size = params["text_font_size"]
+    text_color = params["text_color"]
+    is_private = params["is_private"]
+    caption = params["caption"]
+    circle_slug = params["circle_slug"]
+    collect_enabled = params["collect_enabled"]
+    collect_price = params["collect_price"]
 
     if should_mint and not user_id:
         return jsonify({"error": "userId is required when minting"}), 400
+    if should_mint and user_id:
+        uid = verify_firebase_token(request)
+        if not uid or uid != user_id:
+            return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if not gcs_bucket:
+        return jsonify({"error": "Storage not configured"}), 500
 
     tmp_dir = tempfile.mkdtemp()
     try:
-        # Save uploaded files to temp directory
+        # Download clips from GCS (uploaded by the client via /mint/upload-url
+        # with objectKind "stitch") into the temp directory.
         input_paths = []
-        for i, f in enumerate(uploaded_files):
+        for i in range(params["clip_count"]):
+            blob = gcs_bucket.blob(stitch_object_path(params["stitch_id"], i))
+            if not blob.exists():
+                return jsonify({"error": f"Clip {i} not found"}), 400
             path = os.path.join(tmp_dir, f"clip_{i}.mp4")
-            f.save(path)
+            blob.download_to_filename(path)
             input_paths.append(path)
 
         # Write FFmpeg concat list
@@ -5281,6 +5556,11 @@ def stitch_videos():
         return jsonify({"error": f"Error stitching videos: {e}"}), 500
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        for i in range(params["clip_count"]):
+            try:
+                gcs_bucket.blob(stitch_object_path(params["stitch_id"], i)).delete()
+            except Exception:
+                pass
 
 
 @app.route("/posts/<token_id>/sync-counts", methods=["POST"])
