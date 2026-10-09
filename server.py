@@ -29,6 +29,7 @@ from firebase_admin import auth as firebase_auth
 from firebase_admin import messaging
 from google.cloud.firestore_v1.transforms import Increment as FirestoreIncrement
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
+from google.cloud.firestore_v1.base_query import FieldFilter
 from google.api_core.exceptions import AlreadyExists, NotFound
 from cryptography.fernet import Fernet
 from google.cloud import storage as gcs_storage
@@ -106,7 +107,9 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 # OpenAI for content moderation
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# timeout bounds every moderation call (vision + whisper); callers already
+# catch and fall back, so a hung OpenAI request can no longer stall a mint.
+openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=120) if OPENAI_API_KEY else None
 
 # Shared secret for the Cloud Scheduler -> /cleanup-expired-stories call
 CLEANUP_SECRET = os.getenv("CLEANUP_SECRET")
@@ -168,6 +171,14 @@ TASKS_QUEUE = os.getenv("TASKS_QUEUE")
 TASKS_TARGET_URL = os.getenv("TASKS_TARGET_URL")  # full URL to /mint/process
 TASKS_INVOKER_SA_EMAIL = os.getenv("TASKS_INVOKER_SA_EMAIL")
 MINT_WORKER_SECRET = os.getenv("MINT_WORKER_SECRET")
+
+# A mint job stuck in "queued"/"processing" longer than this is presumed dead —
+# the worker was hard-killed (OOM, crash, deploy mid-mint) so its except block
+# never marked the job failed — and is swept to "failed" so the client's
+# pending card can enter the repost/discard recovery flow. Must comfortably
+# exceed the longest legitimate mint: the Cloud Run request timeout bounds a
+# worker run, and the on-chain receipt wait alone caps at 180s.
+STALE_MINT_JOB_MINUTES = int(os.getenv("STALE_MINT_JOB_MINUTES", "15"))
 
 _tasks_client = None
 
@@ -1339,7 +1350,10 @@ def _pin_bytes_to_pinata(file_data, filename, content_type="application/octet-st
     last_err = None
     for attempt in range(4):
         response = requests.post(
-            url, files={"file": (filename, file_data, content_type)}, headers=headers
+            url,
+            files={"file": (filename, file_data, content_type)},
+            headers=headers,
+            timeout=60,
         )
         if response.status_code == 200:
             return response.json()["IpfsHash"]
@@ -1435,7 +1449,7 @@ def pin_metadata_to_ipfs(
     headers = _pinata_headers(content_json=True)
     last_err = None
     for attempt in range(4):
-        response = requests.post(url, json=metadata, headers=headers)
+        response = requests.post(url, json=metadata, headers=headers, timeout=30)
         if response.status_code == 200:
             uri = f"ipfs://{response.json()['IpfsHash']}"
             return (uri, None) if return_key else uri
@@ -1734,7 +1748,11 @@ def get_virtual_tokens(user_id):
 def cancel_pending():
     """
     Endpoint to manually cancel all pending transactions.
+    Admin-only: sends real (0-value, gas-costing) transactions, so it is gated
+    behind the same X-Cleanup-Secret used by the other maintenance endpoints.
     """
+    if not CLEANUP_SECRET or request.headers.get("X-Cleanup-Secret") != CLEANUP_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
     try:
         cancelled = cancel_pending_transactions()
         return jsonify(
@@ -2480,6 +2498,81 @@ def build_mint_items(job, download_bytes, read_b64):
     return items
 
 
+def sweep_stale_mint_jobs():
+    """Fail mint jobs whose worker died without reporting.
+
+    A hard-killed /mint/process (OOM, crash, deploy mid-mint) never runs its
+    except block, leaving the job doc in "processing" forever — and the claim
+    transaction skips redelivered tasks, so nothing ever rescues it. The client
+    shows "Finishing" until the doc reaches a terminal status, so stale jobs
+    must be flipped to "failed" for the user to get their repost/discard
+    recovery card.
+
+    Transactional per job: a job that turned terminal between the query and
+    the flip is left alone, and a slow-but-alive worker that finishes after a
+    sweep overwrites "failed" with "done" (correct — the post landed). Never
+    re-runs the mint: the dead attempt may have minted on-chain before dying,
+    so a re-run could double-mint; recovery is the client's manual repost,
+    which uses a fresh uploadId.
+
+    Returns the number of jobs flipped to failed.
+    """
+    if not firestore_db:
+        return 0
+    from datetime import timedelta
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_MINT_JOB_MINUTES)
+    stuck = (
+        firestore_db.collection("mintJobs")
+        .where(filter=FieldFilter("status", "in", ["queued", "processing"]))
+        .stream()
+    )
+
+    flipped = 0
+    for snap in stuck:
+        d = snap.to_dict() or {}
+        # A claimed job ages from when the worker started; a queued one whose
+        # task was lost ages from creation.
+        last_alive = d.get("startedAt") or d.get("createdAt")
+        if last_alive is None or last_alive > cutoff:
+            continue
+        job_ref = firestore_db.collection("mintJobs").document(snap.id)
+
+        @fb_firestore.transactional
+        def _fail_if_still_stuck(txn, ref=job_ref):
+            cur = ref.get(transaction=txn).to_dict() or {}
+            if cur.get("status") not in ("queued", "processing"):
+                return False
+            txn.update(
+                ref,
+                {
+                    "status": "failed",
+                    "error": "The upload timed out on the server.",
+                    "finishedAt": SERVER_TIMESTAMP,
+                },
+            )
+            return True
+
+        try:
+            if _fail_if_still_stuck(firestore_db.transaction()):
+                flipped += 1
+                print(f"[mint/sweep] job {snap.id} stale -> failed")
+                _cleanup_mint_upload(snap.id)
+        except Exception as e:
+            print(f"[mint/sweep] could not fail job {snap.id}: {e}")
+    return flipped
+
+
+@app.route("/mint/sweep", methods=["POST"])
+def mint_sweep():
+    """Fail stuck mint jobs (see sweep_stale_mint_jobs). Meant to be hit by
+    Cloud Scheduler every ~10 minutes; same auth as /mint/process so only the
+    scheduler (OIDC) or a caller with the shared secret can trigger it."""
+    if not verify_mint_worker(request):
+        return jsonify({"error": "Unauthorized"}), 403
+    return jsonify({"swept": sweep_stale_mint_jobs()}), 200
+
+
 @app.route("/mint/process", methods=["POST"])
 def mint_process():
     """
@@ -2492,6 +2585,14 @@ def mint_process():
         return jsonify({"error": "Unauthorized"}), 403
     if not firestore_db or not gcs_bucket:
         return jsonify({"error": "Server not configured"}), 500
+
+    # Opportunistic rescue: each worker run also sweeps jobs an earlier,
+    # hard-killed worker left behind, so stuck jobs clear on the next post
+    # even if the Cloud Scheduler sweep isn't configured.
+    try:
+        sweep_stale_mint_jobs()
+    except Exception as e:
+        print(f"[mint/process] opportunistic sweep failed (non-blocking): {e}")
 
     data = request.get_json(silent=True) or {}
     job_id = data.get("jobId")
@@ -2568,7 +2669,19 @@ def generate_signed_url(blob, method, expiration, headers=None):
     scope = "https://www.googleapis.com/auth/devstorage.read_write"
     if not hasattr(credentials, "sign_bytes"):
         target_principal = getattr(credentials, "service_account_email", None)
-        if not target_principal:
+        if target_principal == "default":
+            # Compute credentials report the literal placeholder "default"
+            # until their first token refresh resolves the real SA email from
+            # the metadata server. On a cold instance whose first GCS use is a
+            # signing call (e.g. /mint/upload-url — unlike /media, it does no
+            # blob.exists() read first), impersonating "default" fails and
+            # every signed-URL request 500s until some other GCS call warms
+            # the credentials. Refresh explicitly so the real email is used.
+            from google.auth.transport import requests as google_auth_requests
+
+            credentials.refresh(google_auth_requests.Request())
+            target_principal = getattr(credentials, "service_account_email", None)
+        if not target_principal or target_principal == "default":
             raise RuntimeError("Current GCS credentials cannot sign URLs")
         signing_credentials = imp_creds.Credentials(
             source_credentials=credentials,
@@ -2679,11 +2792,17 @@ def unlock_post():
         return jsonify({"error": "Firebase not configured on server"}), 500
 
     data = request.get_json()
-    if not data or "tokenId" not in data or "viewerId" not in data:
-        return jsonify({"error": "Missing tokenId or viewerId"}), 400
+    if not data or "tokenId" not in data:
+        return jsonify({"error": "Missing tokenId"}), 400
 
     token_id = str(data["tokenId"])
-    viewer_id = data["viewerId"]
+    # Derive the viewer from the verified token — never trust a body viewerId
+    # (a caller could pass the owner's id and decrypt any private post). The
+    # owner/follower check below runs against this uid. Clients may still send
+    # viewerId in the body; it is ignored.
+    viewer_id = verify_firebase_token(request)
+    if not viewer_id:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
 
     try:
         # Read the post from Firestore
@@ -3278,6 +3397,10 @@ def story_upload():
     base64_media = data["image"]
     user_id = data["userId"]
     media_type = data.get("mediaType", "photo")
+
+    err = _require_uid(user_id)
+    if err:
+        return err
 
     raw_bytes = base64.b64decode(base64_media)
     story_id = str(uuid.uuid4())
@@ -4513,7 +4636,12 @@ def set_glas_price():
     """
     POST endpoint for admin to set GLAS USD price.
     Body: { priceUsd }
+    Admin-only (no app callers): gated behind X-Cleanup-Secret like the other
+    maintenance endpoints — Firebase auth alone would let any signed-in user
+    set the token price.
     """
+    if not CLEANUP_SECRET or request.headers.get("X-Cleanup-Secret") != CLEANUP_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
     if not glas_contract:
         return jsonify({"error": "Glas contract not configured"}), 500
 
@@ -5342,14 +5470,28 @@ def resolve_stitch_params(data):
         collect_price = float(collect_price_raw) if collect_price_raw not in ("", None) else None
     except (ValueError, TypeError):
         collect_price = None
+    # Overlay params get interpolated into an FFmpeg filtergraph, so when an
+    # overlay is requested they are whitelisted (not escaped): fontsize must be
+    # a small integer, color a named color or hex value. Without an overlay the
+    # params are unused — force defaults so junk values can't fail the request.
+    text_overlay = (data.get("textOverlay") or "").strip()
+    text_font_size = str(data.get("textFontSize", "48"))
+    text_color = str(data.get("textColor", "white"))
+    if text_overlay:
+        if not re.fullmatch(r"\d{1,3}", text_font_size) or not 8 <= int(text_font_size) <= 300:
+            raise ValueError("Invalid textFontSize")
+        if not re.fullmatch(r"[A-Za-z]{1,30}|(0x|#)?[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?", text_color):
+            raise ValueError("Invalid textColor")
+    else:
+        text_font_size, text_color = "48", "white"
     return {
         "stitch_id": data["stitchId"],
         "clip_count": clip_count,
         "user_id": data.get("userId"),
         "should_mint": str(data.get("mint", "true")).lower() == "true",
-        "text_overlay": (data.get("textOverlay") or "").strip(),
-        "text_font_size": str(data.get("textFontSize", "48")),
-        "text_color": data.get("textColor", "white"),
+        "text_overlay": text_overlay,
+        "text_font_size": text_font_size,
+        "text_color": text_color,
         "is_private": bool(data.get("isPrivate", False)),
         "caption": (data.get("caption") or "").strip() or None,
         "circle_slug": (data.get("circleSlug") or "").strip() or None,
@@ -5391,10 +5533,13 @@ def stitch_videos():
 
     if should_mint and not user_id:
         return jsonify({"error": "userId is required when minting"}), 400
-    if should_mint and user_id:
-        uid = verify_firebase_token(request)
-        if not uid or uid != user_id:
-            return jsonify({"error": "Missing or invalid authorization token"}), 401
+    # Auth unconditionally (not just when minting): stitching burns ffmpeg CPU
+    # and GCS bandwidth, so anonymous callers shouldn't reach it at all.
+    uid = verify_firebase_token(request)
+    if not uid:
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
+    if user_id and uid != user_id:
+        return jsonify({"error": "Forbidden"}), 403
     if not gcs_bucket:
         return jsonify({"error": "Storage not configured"}), 500
 
@@ -5446,9 +5591,14 @@ def stitch_videos():
         if text_overlay:
             overlay_input = output_path
             output_path = os.path.join(tmp_dir, "output_text.mp4")
-            escaped_text = text_overlay.replace("'", "\\'").replace(":", "\\:")
+            # The text goes through a textfile (never inline in the filtergraph)
+            # so no user-controlled characters reach the filter parser; fontsize
+            # and fontcolor were whitelisted in resolve_stitch_params.
+            overlay_text_path = os.path.join(tmp_dir, "overlay.txt")
+            with open(overlay_text_path, "w", encoding="utf-8") as tf:
+                tf.write(text_overlay)
             drawtext_filter = (
-                f"drawtext=text='{escaped_text}'"
+                f"drawtext=textfile='{overlay_text_path}'"
                 f":fontsize={text_font_size}"
                 f":fontcolor={text_color}"
                 f":x=(w-text_w)/2:y=(h-text_h)/2"

@@ -4,6 +4,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# Unbuffered stdout: without this, print()ed errors sit in a block buffer and
+# never reach Cloud Logging in time to debug (werkzeug's request lines go to
+# stderr and show up; the app's own error prints didn't).
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
 COPY requirements.txt .
