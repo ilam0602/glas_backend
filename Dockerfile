@@ -15,6 +15,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
+COPY csam_screening.py .
 COPY economy_v2.py .
 COPY payout_provider.py .
 COPY AuthenSnap.json .
