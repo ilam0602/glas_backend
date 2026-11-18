@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 from web3 import Web3
 from web3.datastructures import AttributeDict
@@ -53,6 +53,7 @@ from payout_provider import (
     verify_bridge_webhook,
     verify_crossmint_webhook,
 )
+import csam_screening
 
 # Load environment variables from .env file
 load_dotenv()
@@ -63,12 +64,11 @@ CONTRACT_ADDRESS = os.getenv("CONTRACT_ADDRESS")
 TOKEN_CONTRACT_ADDRESS = os.getenv("TOKEN_CONTRACT_ADDRESS")
 GLAS_CONTRACT_ADDRESS = os.getenv("GLAS_CONTRACT_ADDRESS")
 
-# Pinata API keys — legacy IPFS pinning, used only as a fallback when Filebase
-# is not configured.
+# Pinata API keys — Filebase is the sole pinning path now (see FILEBASE_ENABLED
+# below); these are retained ONLY so we can keep unpinning legacy content that
+# was pinned to Pinata before Filebase existed (see _unpin_from_pinata).
 PINATA_API_KEY = os.getenv("PINATA_API_KEY")
 PINATA_SECRET_API_KEY = os.getenv("PINATA_SECRET_API_KEY")
-PINATA_PIN_FILE_URL = "https://api.pinata.cloud/pinning/pinFileToIPFS"
-PINATA_PIN_JSON_URL = "https://api.pinata.cloud/pinning/pinJSONToIPFS"
 
 
 def _pinata_headers(content_json=False):
@@ -81,10 +81,11 @@ def _pinata_headers(content_json=False):
         headers["Content-Type"] = "application/json"
     return headers
 
-# Filebase — primary IPFS pinning (IPFS-backed S3, cheaper + higher request
-# limits than Pinata). When all three are set, all new pins go to Filebase and
-# Pinata is bypassed. Content addressing means the ipfs:// CIDs are identical
-# regardless of provider, so tokenURIs stay standard and portable.
+# Filebase — sole IPFS pinning provider (IPFS-backed S3, cheaper + higher
+# request limits than Pinata). Required at startup (see the RuntimeError check
+# below); there is no pinning fallback anymore. Content addressing means the
+# ipfs:// CIDs it produces are identical to what Pinata would have produced for
+# the same bytes, so tokenURIs stay standard and portable.
 FILEBASE_KEY = os.getenv("FILEBASE_KEY")
 FILEBASE_SECRET = os.getenv("FILEBASE_SECRET")
 FILEBASE_BUCKET = os.getenv("FILEBASE_BUCKET")
@@ -93,6 +94,15 @@ FILEBASE_ENABLED = bool(FILEBASE_KEY and FILEBASE_SECRET and FILEBASE_BUCKET)
 # Gateway used to build https URLs inside ERC-721 metadata JSON (provider-neutral;
 # override with your Filebase dedicated gateway for faster marketplace previews).
 IPFS_GATEWAY = os.getenv("IPFS_GATEWAY", "https://ipfs.io/ipfs/")
+# Public gateway that GET /ipfs/<cid> redirects to. This is gateway.pinata.cloud
+# because that's what glass_mobile already renders from today, so switching
+# media through our own /ipfs/<cid> route (for blocklist enforcement) doesn't
+# change which bytes end up on screen. It is a PUBLIC gateway, unrelated to our
+# Pinata pinning account/credentials above -- it would resolve any CID pinned
+# by anyone, on any provider, the same way ipfs.io or any other gateway would.
+IPFS_REDIRECT_GATEWAY = os.getenv(
+    "IPFS_REDIRECT_GATEWAY", "https://gateway.pinata.cloud/ipfs/"
+)
 
 # Placeholder image used in the PUBLIC on-chain metadata of PRIVATE posts. Private
 # media is never published to public IPFS, so its NFT metadata must not point at the
@@ -262,11 +272,15 @@ def _require_uid(claimed_uid):
 if not (RPC_URL and PRIVATE_KEY and CONTRACT_ADDRESS):
     raise Exception("Missing one or more required environment variables.")
 
-# Need at least one IPFS pinning provider configured.
-if not (FILEBASE_ENABLED or (PINATA_API_KEY and PINATA_SECRET_API_KEY)):
-    raise Exception(
-        "No IPFS pinning provider configured: set FILEBASE_KEY/FILEBASE_SECRET/"
-        "FILEBASE_BUCKET (preferred) or PINATA_API_KEY/PINATA_SECRET_API_KEY."
+# Filebase is the sole IPFS pinning provider now -- fail fast rather than let a
+# deploy that's missing Filebase env silently fall back to a Pinata pinning
+# path that no longer exists. PINATA_API_KEY/PINATA_SECRET_API_KEY are optional
+# and unpin-only (see _unpin_from_pinata) -- they are not a substitute here.
+if not FILEBASE_ENABLED:
+    raise RuntimeError(
+        "Filebase is not configured: set FILEBASE_KEY/FILEBASE_SECRET/"
+        "FILEBASE_BUCKET. Pinata keys, if set, are unpin-only and cannot "
+        "serve as a pinning fallback."
     )
 
 # Connect to Sepolia node
@@ -1343,53 +1357,26 @@ def _filebase_put(key, data, content_type):
     raise Exception(f"Filebase upload failed after retries: {last_err}")
 
 
-def _pin_bytes_to_pinata(file_data, filename, content_type="application/octet-stream"):
-    """Legacy fallback: pin raw bytes to Pinata, returning the CID (no ipfs:// prefix)."""
-    url = PINATA_PIN_FILE_URL
-    headers = _pinata_headers()
-    last_err = None
-    for attempt in range(4):
-        response = requests.post(
-            url,
-            files={"file": (filename, file_data, content_type)},
-            headers=headers,
-            timeout=60,
-        )
-        if response.status_code == 200:
-            return response.json()["IpfsHash"]
-        last_err = response.text
-        # Only bother retrying transient throttling/5xx.
-        if response.status_code in (429, 500, 502, 503, 504) and attempt < 3:
-            time.sleep(2 ** attempt)
-            continue
-        break
-    raise Exception(f"Pinata upload error: {last_err}")
-
-
 def pin_file_to_ipfs(base64_image_str, media_type="photo", return_key=False):
     """
-    Upload media to IPFS and return an ipfs:// URI. Uses Filebase when configured,
-    otherwise falls back to Pinata. The CID (and thus the ipfs:// URI) is the same
-    across providers because it is derived from the content itself.
+    Upload media to IPFS via Filebase and return an ipfs:// URI. Filebase is the
+    sole pinning path (enforced by the startup RuntimeError check); Pinata is
+    retained only for unpinning legacy content pinned there before Filebase
+    existed (see _unpin_from_pinata).
 
-    When return_key=True, returns (ipfs_uri, provider_key) where provider_key is the
-    Filebase object key (needed for later unpin) or None for the Pinata path (Pinata
-    unpins by CID, which is recoverable from the URI). Existing callers that omit
-    return_key keep receiving just the ipfs_uri string, so their behavior is unchanged.
+    When return_key=True, returns (ipfs_uri, provider_key) where provider_key is
+    the Filebase object key (needed for later unpin). Existing callers that omit
+    return_key keep receiving just the ipfs_uri string, so their behavior is
+    unchanged.
     """
     file_data = base64.b64decode(base64_image_str)
     is_video = media_type == "video"
-    filename = "nft_video.mp4" if is_video else "nft_image.png"
     content_type = "video/mp4" if is_video else "image/png"
+    ext = "mp4" if is_video else "png"
 
-    if FILEBASE_ENABLED:
-        ext = "mp4" if is_video else "png"
-        cid, key = _filebase_put(f"nft/{uuid.uuid4().hex}.{ext}", file_data, content_type)
-        uri = f"ipfs://{cid}"
-        return (uri, key) if return_key else uri
-
-    uri = f"ipfs://{_pin_bytes_to_pinata(file_data, filename, content_type)}"
-    return (uri, None) if return_key else uri
+    cid, key = _filebase_put(f"nft/{uuid.uuid4().hex}.{ext}", file_data, content_type)
+    uri = f"ipfs://{cid}"
+    return (uri, key) if return_key else uri
 
 
 def pin_metadata_to_ipfs(
@@ -1401,8 +1388,8 @@ def pin_metadata_to_ipfs(
     return_key=False,
 ):
     """
-    Build the ERC-721 metadata JSON and pin it to IPFS (Filebase when configured,
-    else Pinata). Returns the ipfs:// URI of the metadata JSON (the tokenURI).
+    Build the ERC-721 metadata JSON and pin it to IPFS via Filebase. Returns the
+    ipfs:// URI of the metadata JSON (the tokenURI).
 
     OpenSea (and other marketplaces) expect tokenURI to point to a JSON file like:
     {
@@ -1436,29 +1423,12 @@ def pin_metadata_to_ipfs(
             for (item_ipfs, item_type) in media_items
         ]
 
-    if FILEBASE_ENABLED:
-        body = json.dumps(metadata).encode("utf-8")
-        cid, key = _filebase_put(
-            f"nft/metadata/{uuid.uuid4().hex}.json", body, "application/json"
-        )
-        uri = f"ipfs://{cid}"
-        return (uri, key) if return_key else uri
-
-    # Pinata fallback: pinJSONToIPFS.
-    url = PINATA_PIN_JSON_URL
-    headers = _pinata_headers(content_json=True)
-    last_err = None
-    for attempt in range(4):
-        response = requests.post(url, json=metadata, headers=headers, timeout=30)
-        if response.status_code == 200:
-            uri = f"ipfs://{response.json()['IpfsHash']}"
-            return (uri, None) if return_key else uri
-        last_err = response.text
-        if response.status_code in (429, 500, 502, 503, 504) and attempt < 3:
-            time.sleep(2 ** attempt)
-            continue
-        break
-    raise Exception(f"Pinata metadata upload error: {last_err}")
+    body = json.dumps(metadata).encode("utf-8")
+    cid, key = _filebase_put(
+        f"nft/metadata/{uuid.uuid4().hex}.json", body, "application/json"
+    )
+    uri = f"ipfs://{cid}"
+    return (uri, key) if return_key else uri
 
 
 def _unpin_from_pinata(cid):
@@ -1489,6 +1459,59 @@ def _extract_cid(ipfs_url):
     else:
         return None
     return (s.split("/", 1)[0].split("?", 1)[0]) or None
+
+
+# CIDs are base58/base32 strings (no "/", "?", etc); this is intentionally loose
+# (it doesn't validate CIDv0 vs CIDv1 structure) and exists only to reject
+# obviously-malformed path segments before they reach Firestore/the gateway.
+CID_PATTERN = re.compile(r"^[A-Za-z0-9]{10,128}$")
+
+# In-memory cache of the `blockedCids` collection's document IDs (one doc per
+# blocked CID, keyed by CID). Refreshed at most once per TTL so that serving
+# /ipfs/<cid> doesn't do a Firestore read on every single image load.
+_BLOCKED_CIDS_CACHE_TTL_SECONDS = 60
+_blocked_cids_cache = set()
+_blocked_cids_cache_loaded_at = 0.0
+
+
+def _get_blocked_cids():
+    """
+    Returns the set of currently-blocked CIDs, refreshing from Firestore's
+    `blockedCids` collection when the in-memory cache is older than
+    _BLOCKED_CIDS_CACHE_TTL_SECONDS.
+
+    On any Firestore error, logs it and returns the stale cached set (empty if
+    nothing has ever loaded successfully) instead of raising. This is an
+    intentional fail-open: briefly under-blocking (serving a CID that was just
+    blocked) is a far smaller problem than 500ing every single image load in
+    the app because Firestore hiccuped.
+    """
+    global _blocked_cids_cache, _blocked_cids_cache_loaded_at
+    now = time.time()
+    if now - _blocked_cids_cache_loaded_at < _BLOCKED_CIDS_CACHE_TTL_SECONDS:
+        return _blocked_cids_cache
+    if not firestore_db:
+        return _blocked_cids_cache
+    try:
+        docs = firestore_db.collection("blockedCids").stream()
+        _blocked_cids_cache = {d.id for d in docs}
+        _blocked_cids_cache_loaded_at = now
+    except Exception as e:
+        print(f"[blocklist] Failed to refresh blockedCids cache: {e}")
+    return _blocked_cids_cache
+
+
+def _is_cid_blocked(cid):
+    """Whether `cid` is in the (possibly briefly stale) blockedCids cache."""
+    return cid in _get_blocked_cids()
+
+
+def _invalidate_blocked_cids_cache():
+    """Forces the next _get_blocked_cids() call to re-query Firestore. Call
+    this after any write to the blockedCids collection so a block/unblock is
+    reflected immediately rather than waiting out the TTL."""
+    global _blocked_cids_cache_loaded_at
+    _blocked_cids_cache_loaded_at = 0.0
 
 
 def unpin_post_media(post_data):
@@ -1776,15 +1799,91 @@ class MintError(Exception):
         self.tx_hash = tx_hash
 
 
+# Uploader-facing message for ANY CSAM screening failure (known match, or a
+# provider error under CSAM_FAIL_MODE=closed). Deliberately indistinguishable
+# from every other mint failure -- tipping off a subject can constitute
+# obstruction and invites evasion (spec Sec 5). Never append provider/verdict
+# detail to this string.
+CSAM_GENERIC_UPLOAD_ERROR = "This upload couldn't be processed."
+
+
+def _csam_screen_mint_item(item, index, user_id):
+    """Screen one raw mint item for CSAM BEFORE compression/IPFS pin/mint.
+    `item` is the same {"image": b64} | {"raw_bytes": bytes} shape
+    process_mint_media_item accepts. Raises MintError (generic message) on a
+    known match, or on a provider error when CSAM_FAIL_MODE=closed. Returns
+    the list (0 or 1) of pending-ticket ids written, for the caller to patch
+    with `tokenId` once minting succeeds.
+
+    No-op when csam_screening.CSAM_SCREEN_PROVIDER == "disabled" (the
+    default): the `is_enabled()` check below returns immediately, before even
+    base64-decoding the item -- items can carry up to 150MB of video, so a
+    redundant decode (process_mint_media_item decodes again right after this
+    returns) is not a cost worth paying just to hand the bytes to a no-op.
+    """
+    if not csam_screening.is_enabled():
+        return []
+
+    try:
+        raw_bytes = item.get("raw_bytes")
+        if raw_bytes is None:
+            raw_bytes = base64.b64decode(item["image"])
+        media_type = item["mediaType"]
+        content_type = "video/mp4" if media_type == "video" else "image/jpeg"
+        context = {"uid": user_id, "source": "mint", "itemIndex": index}
+
+        screen_fn = (
+            csam_screening.screen_video_bytes
+            if media_type == "video"
+            else csam_screening.screen_image_bytes
+        )
+        result = screen_fn(
+            raw_bytes, content_type, context,
+            gcs_bucket=gcs_bucket, sign_url_fn=_csam_sign_url,
+        )
+    except Exception as e:
+        # A decode/setup failure here (e.g. malformed base64) is NOT a CSAM
+        # verdict -- surface it the same way step 1 (process_mint_media_item)
+        # would have, rather than letting it escape as a raw, unhandled
+        # exception. Deliberately outside the verdict-handling below so a
+        # real "known_match" MintError can never be caught and reworded here.
+        print(f"[csam] screening item {index} raised a non-CSAM error: {e}")
+        raise MintError(f"Error uploading item {index} to IPFS: {e}")
+
+    if result.verdict == "known_match":
+        csam_screening.handle_match(
+            firestore_db, gcs_client, raw_bytes, content_type, result, context,
+            send_admin_alert_fn=_csam_notify_admins,
+        )
+        raise MintError(CSAM_GENERIC_UPLOAD_ERROR)
+    if result.verdict == "error":
+        if csam_screening.should_fail_closed():
+            print(f"[csam] mint item {index} screen error, failing CLOSED: {result.provider_ref}")
+            raise MintError(CSAM_GENERIC_UPLOAD_ERROR)
+        print(f"[csam][CRITICAL] mint item {index} screen error, failing OPEN (proceeding): {result.provider_ref}")
+        return []
+    if result.verdict == "pending":
+        ticket_id = csam_screening.write_pending_ticket(firestore_db, result, context)
+        return [ticket_id] if ticket_id else []
+    return []  # "clear"
+
+
 def run_mint_pipeline(items_in, user_id, wallet_address, is_private, is_carousel):
     """
-    Core mint: compress+pin+moderate each item, pin metadata, mint on-chain,
-    upload HQ media. Returns the response_data dict. Raises MintError on failure.
+    Core mint: screen+compress+pin+moderate each item, pin metadata, mint
+    on-chain, upload HQ media. Returns the response_data dict. Raises
+    MintError on failure.
 
     Does NOT create the Firestore post or credit points — callers own that:
     the sync /mint keeps the legacy client-driven savePost; the async worker
     (/mint/process) does it server-side via save_post_server + _credit_post.
     """
+    # 0. CSAM pre-screen every item BEFORE any compression/publish/pin/mint
+    #    (see docs/specs/2026-10-09-csam-screening-quarantine-report-design.md).
+    pending_ticket_ids = []
+    for index, item in enumerate(items_in):
+        pending_ticket_ids.extend(_csam_screen_mint_item(item, index, user_id))
+
     # 1. Compress + pin to IPFS + moderate every item (order preserved)
     processed = []
     for index, item in enumerate(items_in):
@@ -1793,8 +1892,8 @@ def run_mint_pipeline(items_in, user_id, wallet_address, is_private, is_carousel
                 process_mint_media_item(item, item["mediaType"], is_private)
             )
         except Exception as e:
-            print(f"Item {index} Pinata upload failed: {e}")
-            raise MintError(f"Error uploading item {index} to Pinata: {e}")
+            print(f"Item {index} IPFS upload failed: {e}")
+            raise MintError(f"Error uploading item {index} to IPFS: {e}")
 
     primary = processed[0]
     media_type = primary["media_type"]
@@ -1841,7 +1940,7 @@ def run_mint_pipeline(items_in, user_id, wallet_address, is_private, is_carousel
         print(f"Metadata uploaded to IPFS: {metadata_ipfs_url}")
     except Exception as e:
         print(e)
-        raise MintError(f"Error uploading metadata to Pinata: {e}")
+        raise MintError(f"Error uploading metadata to IPFS: {e}")
 
     # 3. Build + send the mint transaction
     try:
@@ -1865,6 +1964,12 @@ def run_mint_pipeline(items_in, user_id, wallet_address, is_private, is_carousel
     except Exception as e:
         print(f"Error details: {e}")
         raise MintError(str(e), tx_hash=tx_hash.hex() if "tx_hash" in locals() else None)
+
+    # Any CSAM screening ticket(s) written in step 0 were created before a
+    # tokenId existed; now that minting succeeded, attach it so the /csam/sweep
+    # reconcile job can locate (and if needed take down) this exact post.
+    for ticket_id in pending_ticket_ids:
+        csam_screening.attach_ticket_linkage(firestore_db, ticket_id, tokenId=str(token_id))
 
     # Record the server-computed point value keyed by tokenId (legacy claim flow).
     if user_id and firestore_db:
@@ -2573,6 +2678,116 @@ def mint_sweep():
     return jsonify({"swept": sweep_stale_mint_jobs()}), 200
 
 
+def _csam_fetch_ticket_media(ticket_data):
+    """Best-effort fetch of the now-published media a pending CSAM ticket
+    pointed at, so /csam/sweep can still produce a quarantine copy if the
+    ticket later resolves to a match (the content has already been
+    published by the time a "pending" ticket exists -- see csam_screening's
+    module docstring on the "pending" verdict). Returns (bytes, content_type)
+    or None if the media can't be located; a None result still lets the
+    incident get recorded (stopping further distribution via the takedown
+    matters more than a quarantine copy that can't be produced)."""
+    token_id = ticket_data.get("tokenId")
+    if token_id and firestore_db and gcs_bucket:
+        post_doc = firestore_db.collection("posts").document(str(token_id)).get()
+        if post_doc.exists:
+            post = post_doc.to_dict() or {}
+            media_type = post.get("mediaType", "photo")
+            ext, content_type = (
+                ("mp4", "video/mp4") if media_type == "video" else ("jpg", "image/jpeg")
+            )
+            blob = gcs_bucket.blob(f"hq_media/{token_id}.{ext}")
+            if blob.exists():
+                return blob.download_as_bytes(), content_type
+
+    media_path = ticket_data.get("mediaPath")
+    if media_path and gcs_bucket:
+        blob = gcs_bucket.blob(media_path.replace("/media/", "", 1))
+        if blob.exists():
+            content_type = _guess_content_type_from_path(media_path)
+            return blob.download_as_bytes(), content_type
+    return None
+
+
+def _guess_content_type_from_path(path: str) -> str:
+    """Best-effort content-type guess from a stored mediaPath's extension,
+    for quarantine manifests where no media-type field was recorded
+    alongside the path (story/avatar/studio tickets)."""
+    lower = path.lower()
+    if lower.endswith(".mp4"):
+        return "video/mp4"
+    if lower.endswith(".png"):
+        return "image/png"
+    return "image/jpeg"
+
+
+def _csam_takedown_from_ticket(ticket_data):
+    """Run the takedown for a CSAM ticket that reconciled to a match.
+
+    Mint-linked tickets (tokenId) reuse the existing /admin/block-post-media
+    logic (unpin + blocklist + flag).
+
+    Non-mint sources (story/avatar/studio) have a `mediaPath` instead of a
+    tokenId -- these are NOT behind the IPFS blocklist, but they ARE served
+    publicly and unauthenticated via GET /media/<path> (see serve_media), so
+    deleting the GCS object at mediaPath IS the correct and sufficient
+    takedown for them.
+    """
+    token_id = ticket_data.get("tokenId")
+    if token_id:
+        _block_post_media_internal(
+            str(token_id), [], "csam_match", "system:csam-sweep"
+        )
+        return
+
+    media_path = ticket_data.get("mediaPath")
+    if media_path and gcs_bucket:
+        try:
+            blob = gcs_bucket.blob(media_path.replace("/media/", "", 1))
+            if blob.exists():
+                blob.delete()
+                print(f"[csam/sweep] deleted {media_path} (source={ticket_data.get('source')})")
+        except Exception as e:
+            print(f"[csam/sweep] failed to delete {media_path}: {e}")
+        # NOTE (avatar specifically): the user's profile avatarUrl field is
+        # owned and written by the mobile client directly in Firestore, not
+        # by this server (/avatar-upload only returns the mediaPath; it
+        # never writes users/{uid} itself) -- there is no authoritative
+        # server-side field name/path to clear here without risking writing
+        # to the wrong place. The GCS object is gone either way (so the URL
+        # 404s), but clearing the stale Firestore reference is a Phase 2 item
+        # (either give /avatar-upload ownership of that write, or have the
+        # sweep look up a known schema once legal/product confirm one).
+        return
+
+    print(
+        f"[csam/sweep] no tokenId/mediaPath linkage on ticket (source="
+        f"{ticket_data.get('source')}); skipping takedown"
+    )
+
+
+@app.route("/csam/sweep", methods=["POST"])
+def csam_sweep():
+    """Reconcile pending CSAM screening tickets (a WebPurify imgstatus check
+    may have resolved to flagged/approved/declined since submission) and
+    purge quarantined evidence past its retention window. Same auth as
+    /mint/sweep -- meant to be hit by Cloud Scheduler.
+
+    A ticket that reconciles to a match gets quarantine+incident FIRST (via
+    csam_screening.handle_match), THEN the public takedown -- never
+    delete-first (spec Sec 6)."""
+    if not verify_mint_worker(request):
+        return jsonify({"error": "Unauthorized"}), 403
+    reconcile_result = csam_screening.sweep_reconcile_pending_tickets(
+        firestore_db, gcs_client,
+        fetch_media_fn=_csam_fetch_ticket_media,
+        block_fn=_csam_takedown_from_ticket,
+        send_admin_alert_fn=_csam_notify_admins,
+    )
+    purged = csam_screening.sweep_purge_expired_incidents(firestore_db, gcs_client)
+    return jsonify({**reconcile_result, "purged": purged}), 200
+
+
 @app.route("/mint/process", methods=["POST"])
 def mint_process():
     """
@@ -2693,6 +2908,76 @@ def generate_signed_url(blob, method, expiration, headers=None):
             headers=headers or None, credentials=signing_credentials)
     return blob.generate_signed_url(
         version="v4", expiration=expiration, method=method, headers=headers or None)
+
+
+def _csam_sign_url(blob, method, expiration):
+    """Adapter passed to csam_screening as `sign_url_fn`: reuses the same
+    self-impersonating v4 signing path as every other signed URL in this
+    file (see generate_signed_url) rather than reinventing GCS signing."""
+    return generate_signed_url(blob, method=method, expiration=expiration)
+
+
+def _send_push_to_uid(uid, title, body, data):
+    """Minimal FCM send to one user's own registered devices: no
+    per-notification-type preference gate (used for system/admin alerts, not
+    social notifications) and no badge management. Shares the token-fetch +
+    messaging.send_each + prune-on-failure shape already established by
+    /push/notify, kept as its own small function (rather than refactoring
+    that route, which has no direct test coverage of its own) specifically
+    so the CSAM admin alert below has exactly one place that talks FCM."""
+    if not firestore_db:
+        return 0
+    token_docs = list(
+        firestore_db.collection("users").document(uid).collection("pushTokens").stream()
+    )
+    if not token_docs:
+        return 0
+    messages = [
+        messaging.Message(
+            token=d.id,
+            notification=messaging.Notification(title=title, body=body),
+            data={k: str(v) for k, v in (data or {}).items() if v is not None},
+        )
+        for d in token_docs
+    ]
+    resp = messaging.send_each(messages)
+    for i, r in enumerate(resp.responses):
+        if not r.success:
+            exc = r.exception
+            if isinstance(exc, (messaging.UnregisteredError, ValueError)) or "not a valid FCM" in str(exc):
+                token_docs[i].reference.delete()
+    return resp.success_count
+
+
+def _csam_notify_admins(incident_id, uid, source, screen_result):
+    """Best-effort push alert to every MODERATION_ADMIN_EMAILS admin that a
+    CSAM incident was just recorded. Passed into csam_screening.handle_match
+    as `send_admin_alert_fn` -- lives here (not in csam_screening.py) because
+    it needs firebase_auth + the push stack, both of which already live in
+    this file. Never raises: handle_match already wraps this call, but it
+    guards its own steps too so one admin's lookup failing doesn't skip the
+    rest."""
+    print(
+        f"[csam][CRITICAL] incident={incident_id} uid={uid} source={source} "
+        f"provider={screen_result.provider} verdict={screen_result.verdict}"
+    )
+    if not firestore_db:
+        return
+    for email in _get_admin_emails():
+        try:
+            admin_user = firebase_auth.get_user_by_email(email)
+        except Exception as e:
+            print(f"[csam] admin lookup failed for {email}: {e}")
+            continue
+        try:
+            _send_push_to_uid(
+                admin_user.uid,
+                "CSAM incident detected",
+                f"Incident {incident_id} needs review.",
+                {"type": "csam_incident", "incidentId": incident_id},
+            )
+        except Exception as e:
+            print(f"[csam] admin push failed for {email}: {e}")
 
 
 @app.route("/media/<path:blob_path>", methods=["GET", "HEAD"])
@@ -3183,6 +3468,237 @@ def admin_unlock_post():
         return jsonify({"error": f"Error unlocking post: {e}"}), 500
 
 
+@app.route("/ipfs/<cid>", methods=["GET"])
+@app.route("/ipfs/<cid>/<path:subpath>", methods=["GET"])
+def serve_ipfs(cid, subpath=None):
+    """
+    Public redirect to the configured IPFS gateway, EXCEPT for CIDs on the
+    blockedCids blocklist (see _is_cid_blocked). This is the one place every
+    client (mobile app, moderation client, any future one) resolves ipfs://
+    media to an https URL, so a takedown here is enforced everywhere, even
+    against third parties that re-pinned the same CID elsewhere -- unlike
+    unpinning our own copy, which only removes OUR copy.
+
+    - 400 if `cid` doesn't look like a CID (defense against path traversal /
+      garbage input reaching Firestore or the upstream gateway).
+    - 451 ("Unavailable For Legal Reasons") if the CID is blocked. 451 is the
+      status code that exists specifically for content withheld in response
+      to a legal/policy demand -- 403/404 would misleadingly suggest a
+      permissions or not-found problem instead of a deliberate takedown.
+      Cache-Control: no-store so a stale "still available" response is never
+      served from an intermediate cache after a block.
+    - 302 redirect to IPFS_REDIRECT_GATEWAY otherwise, with a short
+      Cache-Control so a later block propagates to caches/clients within
+      about 5 minutes instead of being cached indefinitely.
+    """
+    if not CID_PATTERN.match(cid):
+        return jsonify({"error": "Invalid CID"}), 400
+
+    if _is_cid_blocked(cid):
+        response = jsonify({"error": "This content has been removed"})
+        response.status_code = 451
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    target = IPFS_REDIRECT_GATEWAY + cid
+    if subpath:
+        target = f"{target}/{subpath}"
+    redirect_response = redirect(target, code=302)
+    redirect_response.headers["Cache-Control"] = "public, max-age=300"
+    return redirect_response
+
+
+@app.route("/admin/block-post-media", methods=["POST"])
+def admin_block_post_media():
+    """
+    Admin takedown: best-effort unpins a post's media and permanently adds
+    every CID it can find for that post (or any explicitly supplied CIDs) to
+    the blockedCids blocklist, so GET /ipfs/<cid> starts returning 451 for
+    them immediately. This is the REAL "reject" action -- today the
+    moderation client's reject only flags the Firestore post doc and leaves
+    the content pinned/servable, so this route also applies that same
+    flagged/moderationStatus write for parity with the existing flow (not
+    duplicated moderation logic, just the same two fields).
+
+    Auth: same Firebase-ID-token + MODERATION_ADMIN_EMAILS allow-list as
+    /admin/unlock-post.
+    Body: { tokenId?: str, cids?: list[str], reason?: str } -- at least one of
+    tokenId/cids is required.
+    """
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    # Verify the caller is an authenticated admin.
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing bearer token"}), 401
+    try:
+        decoded = firebase_auth.verify_id_token(auth_header.split("Bearer ")[1])
+    except Exception:
+        return jsonify({"error": "Invalid or expired token"}), 401
+
+    admin_emails = _get_admin_emails()
+    caller_email = (decoded.get("email") or "").lower()
+    if not admin_emails:
+        return jsonify({"error": "Server has no MODERATION_ADMIN_EMAILS configured"}), 500
+    if caller_email not in admin_emails:
+        return jsonify({"error": "Not authorized"}), 403
+
+    data = request.get_json() or {}
+    # Presence check, not truthiness: tokenId 0 is a valid token (same pattern
+    # as /admin/unlock-post, which uses `"tokenId" not in data`).
+    raw_token_id = data.get("tokenId")
+    token_id = str(raw_token_id) if raw_token_id is not None and raw_token_id != "" else None
+    explicit_cids = data.get("cids") or []
+    reason = data.get("reason") or "moderation"
+    if not token_id and not explicit_cids:
+        return jsonify({"error": "Provide tokenId and/or cids"}), 400
+
+    if not isinstance(explicit_cids, list):
+        return jsonify({"error": "cids must be a list of CID strings"}), 400
+    for c in explicit_cids:
+        # isinstance guard: a non-string element would TypeError inside
+        # re.match and turn a bad request into a 500.
+        if not isinstance(c, str) or not CID_PATTERN.match(c):
+            return jsonify({"error": f"Invalid cid: {c}"}), 400
+
+    result = _block_post_media_internal(token_id, explicit_cids, reason, caller_email)
+    if result is None:
+        return jsonify({"error": "Post not found"}), 404
+    return jsonify(result)
+
+
+def _block_post_media_internal(token_id, explicit_cids, reason, caller_email):
+    """Core of /admin/block-post-media, split out so the CSAM sweep's
+    reconcile-then-takedown path (see /csam/sweep and the design spec Sec 6 --
+    quarantine+incident must run BEFORE this, never after) can invoke the
+    exact same unpin + blocklist + flag logic instead of duplicating it.
+    Auth and request validation stay in the route; this assumes both already
+    passed.
+
+    Returns None if `token_id` was given but no such post exists (and there
+    are no explicit_cids to fall back on) -- the route maps that to 404.
+    Otherwise returns {"success", "blockedCids", "unpinned"}.
+    """
+    def _maybe_decrypt(value):
+        if not value:
+            return ""
+        try:
+            return decrypt_url(value)
+        except Exception:
+            return value  # old/unencrypted value -- return as stored
+
+    post_ref = None
+    post_data = None
+    if token_id:
+        post_ref = firestore_db.collection("posts").document(token_id)
+        post_doc = post_ref.get()
+        if post_doc.exists:
+            post_data = post_doc.to_dict()
+        elif not explicit_cids:
+            return None
+
+    collected_cids = set(explicit_cids)
+
+    def _collect_cid(cid):
+        # Derived CIDs (post doc / on-chain tokenURI) get the same format
+        # check as explicit ones: blockedCids doc IDs must stay well-formed.
+        if not cid:
+            return
+        if CID_PATTERN.match(cid):
+            collected_cids.add(cid)
+        else:
+            print(f"[admin/block-post-media] skipping malformed cid {cid!r}")
+
+    if post_data is not None:
+        _collect_cid(_extract_cid(_maybe_decrypt(post_data.get("ipfsUrl", ""))))
+        for item in post_data.get("media") or []:
+            _collect_cid(_extract_cid(_maybe_decrypt(item.get("ipfsUrl", ""))))
+        # The minted ERC-721 metadata CID (the tokenURI) isn't persisted on the
+        # post doc -- it exists only on-chain -- so fetch it there, best-effort.
+        try:
+            token_uri = contract.functions.tokenURI(int(token_id)).call()
+            _collect_cid(_extract_cid(token_uri))
+        except Exception as e:
+            print(
+                f"[admin/block-post-media] tokenURI lookup failed for "
+                f"{token_id} (non-fatal): {e}"
+            )
+
+    unpinned = post_data is not None
+    if post_data is not None:
+        try:
+            unpin_post_media(post_data)
+        except Exception as e:
+            print(f"[admin/block-post-media] unpin failed (non-fatal): {e}")
+
+    for cid in collected_cids:
+        firestore_db.collection("blockedCids").document(cid).set({
+            "reason": reason,
+            "tokenId": token_id,
+            "blockedBy": caller_email,
+            "blockedAt": SERVER_TIMESTAMP,
+        })
+
+    if post_ref is not None and post_data is not None:
+        post_ref.set({"flagged": True, "moderationStatus": "rejected"}, merge=True)
+
+    _invalidate_blocked_cids_cache()
+
+    return {
+        "success": True,
+        "blockedCids": sorted(collected_cids),
+        "unpinned": unpinned,
+    }
+
+
+@app.route("/admin/unblock-cid", methods=["POST"])
+def admin_unblock_cid():
+    """
+    Reverses /admin/block-post-media for a single CID: deletes it from the
+    blockedCids blocklist so GET /ipfs/<cid> resumes redirecting to the
+    gateway for it. Does not re-pin content or touch a post's
+    flagged/moderationStatus fields -- those are separate, deliberate
+    moderation-client actions.
+
+    Auth: same Firebase-ID-token + MODERATION_ADMIN_EMAILS allow-list as
+    /admin/unlock-post.
+    Body: { cid }
+    """
+    if not firestore_db:
+        return jsonify({"error": "Firebase not configured on server"}), 500
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing bearer token"}), 401
+    try:
+        decoded = firebase_auth.verify_id_token(auth_header.split("Bearer ")[1])
+    except Exception:
+        return jsonify({"error": "Invalid or expired token"}), 401
+
+    admin_emails = _get_admin_emails()
+    caller_email = (decoded.get("email") or "").lower()
+    if not admin_emails:
+        return jsonify({"error": "Server has no MODERATION_ADMIN_EMAILS configured"}), 500
+    if caller_email not in admin_emails:
+        return jsonify({"error": "Not authorized"}), 403
+
+    data = request.get_json()
+    if not data or "cid" not in data:
+        return jsonify({"error": "Missing cid"}), 400
+    cid = data["cid"]
+    # Validate before using as a Firestore document ID, matching the block path.
+    # A malformed value can never be a real blockedCids entry (those IDs are all
+    # CID_PATTERN-checked at write time), so rejecting it here is safe and keeps
+    # a slash-containing value from being interpreted as a nested Firestore path.
+    if not isinstance(cid, str) or not CID_PATTERN.match(cid):
+        return jsonify({"error": "Invalid cid"}), 400
+
+    firestore_db.collection("blockedCids").document(cid).delete()
+    _invalidate_blocked_cids_cache()
+    return jsonify({"success": True})
+
+
 VALID_REPORT_REASONS = {"spam", "nudity", "violence", "harassment", "other"}
 
 
@@ -3324,6 +3840,79 @@ def mint_story_nft_background(story_id, user_id, media_b64, media_type):
         print(f"Story mint failed for {story_id} (story remains ephemeral): {e}")
 
 
+def _csam_screen_or_reject(
+    raw_bytes, content_type, context, generic_message, generic_status=400,
+    existing_blob_path=None,
+):
+    """Shared CSAM screening gate for the non-mint upload routes (story,
+    avatar, studio, stitch): screens `raw_bytes` and, on a known match (or a
+    provider error under CSAM_FAIL_MODE=closed), returns the (response,
+    status) tuple the caller should return immediately -- call this BEFORE
+    any GCS write so nothing has been persisted at that point.
+
+    `existing_blob_path`: pass this when `raw_bytes` already sit at this path
+    in `gcs_bucket` (as the correct content-type) so the webpurify adapter
+    signs that object directly instead of uploading a redundant
+    csam-screen-tmp/ copy.
+
+    Returns (guard, ticket_id):
+      `guard` is None when the caller should proceed normally (verdict
+      "clear", "pending", or a provider "error" under CSAM_FAIL_MODE=open,
+      logged CRITICALLY), or the (response, status) tuple to return
+      immediately on a match / fail-closed error.
+      `ticket_id` is the csamScreenTickets doc id when verdict is "pending",
+      else None -- callers that don't know their final tokenId/mediaPath
+      yet (avatar, stitch) use this to attach_ticket_linkage once it IS
+      known, the same way run_mint_pipeline attaches tokenId post-mint.
+
+    No-op (always returns (None, None) without any network/GCS call) when
+    csam_screening.CSAM_SCREEN_PROVIDER == "disabled".
+    """
+    if not csam_screening.is_enabled():
+        return None, None
+
+    media_type = "video" if content_type.startswith("video") else "image"
+    try:
+        if media_type == "video":
+            result = csam_screening.screen_video_bytes(
+                raw_bytes, content_type, context,
+                gcs_bucket=gcs_bucket, sign_url_fn=_csam_sign_url,
+            )
+        else:
+            result = csam_screening.screen_image_bytes(
+                raw_bytes, content_type, context,
+                gcs_bucket=gcs_bucket, sign_url_fn=_csam_sign_url,
+                existing_blob_path=existing_blob_path,
+            )
+    except Exception as e:
+        # Mirrors _csam_screen_mint_item: a screening-side exception is not
+        # itself a CSAM verdict. Routes using this helper already have their
+        # own try/except around the surrounding upload logic in most cases,
+        # but this helper must not be the thing that turns a setup bug into
+        # an unhandled 500 either.
+        print(f"[csam] {context.get('source')} screening raised a non-CSAM error: {e}")
+        result = csam_screening.ScreenResult(
+            verdict="error", provider="unknown", provider_ref={"reason": str(e)}
+        )
+
+    if result.verdict == "known_match":
+        csam_screening.handle_match(
+            firestore_db, gcs_client, raw_bytes, content_type, result, context,
+            send_admin_alert_fn=_csam_notify_admins,
+        )
+        return (jsonify({"error": generic_message}), generic_status), None
+    if result.verdict == "error":
+        if csam_screening.should_fail_closed():
+            print(f"[csam] {context.get('source')} screen error, failing CLOSED: {result.provider_ref}")
+            return (jsonify({"error": generic_message}), generic_status), None
+        print(f"[csam][CRITICAL] {context.get('source')} screen error, failing OPEN (proceeding): {result.provider_ref}")
+        return None, None
+    if result.verdict == "pending":
+        ticket_id = csam_screening.write_pending_ticket(firestore_db, result, context)
+        return None, ticket_id
+    return None, None  # "clear"
+
+
 def _story_upload_from_gcs(data):
     """
     GCS variant of /story-upload: the client has already uploaded the
@@ -3348,6 +3937,26 @@ def _story_upload_from_gcs(data):
         return jsonify({"error": "Uploaded story not found"}), 400
 
     hq_bytes = blob.download_as_bytes()
+
+    # CSAM screen. Unlike the base64 path below, the client already uploaded
+    # these bytes directly to GCS (via /mint/upload-url) before this request
+    # -- on a match, delete that blob immediately rather than leaving it in
+    # the main bucket, in addition to the quarantine copy handle_match makes.
+    # mediaPath is already known (it's literally the blob we just read), so a
+    # "pending" ticket can locate this media later without any post-hoc patch.
+    story_media_path = f"/media/{story_object_path(user_id, story_id)}"
+    guard, _ticket_id = _csam_screen_or_reject(
+        hq_bytes, "video/mp4",
+        {"uid": user_id, "source": "story", "storyId": story_id, "mediaPath": story_media_path},
+        "Upload could not be processed.",
+    )
+    if guard is not None:
+        try:
+            blob.delete()
+        except Exception as e:
+            print(f"[csam] failed to delete already-uploaded story blob: {e}")
+        return guard
+
     analysis = analyze_video(hq_bytes)
     media_path = f"/media/{story_object_path(user_id, story_id)}"
 
@@ -3405,18 +4014,32 @@ def story_upload():
     raw_bytes = base64.b64decode(base64_media)
     story_id = str(uuid.uuid4())
 
+    # ext/content_type are fully determined by media_type (identical in both
+    # the compression try/except branches below), so they -- and therefore
+    # the final blob_path/mediaPath -- are knowable before screening even
+    # runs. Passing mediaPath in the ticket context up front means a
+    # "pending" verdict never needs a post-hoc linkage patch for this path.
+    ext, content_type = ("mp4", "video/mp4") if media_type == "video" else ("jpg", "image/jpeg")
+    blob_path = f"stories/{user_id}/{story_id}.{ext}"
+    media_path = f"/media/{blob_path}"
+
+    guard, _ticket_id = _csam_screen_or_reject(
+        raw_bytes, content_type,
+        {"uid": user_id, "source": "story", "storyId": story_id, "mediaPath": media_path},
+        "Upload could not be processed.",
+    )
+    if guard is not None:
+        return guard
+
     try:
         if media_type == "video":
             hq_bytes = compress_video(raw_bytes, target_height=1080, max_fps=60)
-            ext, content_type = "mp4", "video/mp4"
         else:
             hq_base64 = compress_image(base64_media, target_width=1080)
             hq_bytes = base64.b64decode(hq_base64)
-            ext, content_type = "jpg", "image/jpeg"
     except Exception as e:
         print(f"Story compression failed, using original: {e}")
         hq_bytes = raw_bytes
-        ext, content_type = ("mp4", "video/mp4") if media_type == "video" else ("jpg", "image/jpeg")
 
     if media_type == "video":
         analysis = analyze_video(raw_bytes)
@@ -3427,10 +4050,8 @@ def story_upload():
         return jsonify({"error": "Storage not configured"}), 500
 
     try:
-        blob_path = f"stories/{user_id}/{story_id}.{ext}"
         blob = gcs_bucket.blob(blob_path)
         blob.upload_from_string(hq_bytes, content_type=content_type)
-        media_path = f"/media/{blob_path}"
     except Exception as e:
         print(f"Story GCS upload failed: {e}")
         return jsonify({"error": f"Error uploading story: {e}"}), 500
@@ -3478,6 +4099,23 @@ def avatar_upload():
     if shape not in ("circle", "cover"):
         return jsonify({"error": "Invalid shape"}), 400
 
+    # Decode for screening only when the feature is enabled -- the rest of
+    # this route works off the base64 string, so eager decoding here would be
+    # pure wasted work (and an unhandled binascii.Error) in dark mode.
+    guard, ticket_id = (None, None)
+    if csam_screening.is_enabled():
+        try:
+            screen_bytes = base64.b64decode(base64_media)
+        except Exception:
+            return jsonify({"error": "Upload could not be processed."}), 400
+        guard, ticket_id = _csam_screen_or_reject(
+            screen_bytes, "image/jpeg",
+            {"uid": uid, "source": "avatar", "shape": shape},
+            "Upload could not be processed.",
+        )
+    if guard is not None:
+        return guard
+
     try:
         hq_base64 = compress_image(base64_media, target_width=1080)
         hq_bytes = base64.b64decode(hq_base64)
@@ -3494,6 +4132,13 @@ def avatar_upload():
     except Exception as e:
         print(f"Avatar GCS upload failed: {e}")
         return jsonify({"error": f"Error uploading avatar: {e}"}), 500
+
+    # The final filename (hence mediaPath) wasn't known at screening time
+    # (it includes a write-time timestamp) -- now that it is, attach it to
+    # any "pending" ticket so /csam/sweep can locate (and delete) this exact
+    # object if the async review later resolves to a match.
+    if ticket_id:
+        csam_screening.attach_ticket_linkage(firestore_db, ticket_id, mediaPath=media_path)
 
     return jsonify({"mediaPath": media_path})
 
@@ -3883,12 +4528,24 @@ def studio_upload():
     ext, content_type = ("mp4", "video/mp4") if media_type == "video" else ("jpg", "image/jpeg")
     filename = f"{item_id}.{ext}"
     blob_path = f"studio/{uid}/{filename}"
+    media_path = f"/media/{blob_path}"
 
     try:
         media_bytes = media_file.read() if media_file else base64.b64decode(data["media"])
+
+        # blob_path/mediaPath are already known at this point (deterministic
+        # from item_id/media_type, computed above the upload), so a "pending"
+        # ticket can locate this exact object later without a post-hoc patch.
+        guard, _ticket_id = _csam_screen_or_reject(
+            media_bytes, content_type,
+            {"uid": uid, "source": "studio", "itemId": item_id, "mediaPath": media_path},
+            "Upload could not be processed.",
+        )
+        if guard is not None:
+            return guard
+
         media_blob = gcs_bucket.blob(blob_path)
         media_blob.upload_from_string(media_bytes, content_type=content_type)
-        media_path = f"/media/{blob_path}"
 
         thumbnail_path = ""
         thumbnail_file = request.files.get("thumbnail") if is_multipart else None
@@ -4931,14 +5588,12 @@ def extract_virtual_burn_token_id(receipt, contract):
 
 def pin_file_bytes_to_ipfs(file_bytes, filename="stitched.mp4", content_type="video/mp4"):
     """
-    Upload raw file bytes (no base64) to IPFS and return an ipfs:// URI.
-    Uses Filebase when configured, else Pinata. Used by the video-stitch flow.
+    Upload raw file bytes (no base64) to IPFS via Filebase and return an
+    ipfs:// URI. Used by the video-stitch flow.
     """
-    if FILEBASE_ENABLED:
-        ext = filename.rsplit(".", 1)[-1] if "." in filename else "bin"
-        cid, _key = _filebase_put(f"nft/{uuid.uuid4().hex}.{ext}", file_bytes, content_type)
-        return f"ipfs://{cid}"
-    return f"ipfs://{_pin_bytes_to_pinata(file_bytes, filename, content_type)}"
+    ext = filename.rsplit(".", 1)[-1] if "." in filename else "bin"
+    cid, _key = _filebase_put(f"nft/{uuid.uuid4().hex}.{ext}", file_bytes, content_type)
+    return f"ipfs://{cid}"
 
 
 @app.route("/burn", methods=["POST"])
@@ -5539,7 +6194,9 @@ def stitch_videos():
     if not uid:
         return jsonify({"error": "Missing or invalid authorization token"}), 401
     if user_id and uid != user_id:
-        return jsonify({"error": "Forbidden"}), 403
+        # 401 (not 403) to preserve this route's original mismatch response —
+        # pinned by test_stitch_inputs.py and shipped-client error handling.
+        return jsonify({"error": "Missing or invalid authorization token"}), 401
     if not gcs_bucket:
         return jsonify({"error": "Storage not configured"}), 500
 
@@ -5635,6 +6292,18 @@ def stitch_videos():
                 download_name="stitched.mp4",
             )
 
+        # CSAM screen BEFORE compression/IPFS pin/mint -- only reachable when
+        # should_mint, since the non-minting branch above never pins/publishes.
+        # No tokenId exists yet, so a "pending" ticket is patched with it
+        # below once minting succeeds (mirrors run_mint_pipeline).
+        guard, csam_ticket_id = _csam_screen_or_reject(
+            stitched_bytes, "video/mp4",
+            {"uid": user_id, "source": "stitch", "stitchId": params["stitch_id"]},
+            "Upload could not be processed.",
+        )
+        if guard is not None:
+            return guard
+
         # Compress stitched video: 720p for IPFS, 1080p for Firebase Storage
         try:
             lq_bytes = compress_video(
@@ -5661,6 +6330,12 @@ def stitch_videos():
         mint_fn = contract.functions.mintToVirtual(user_id_hash, metadata_ipfs_url)
         tx_hash, receipt = send_contract_transaction(mint_fn, 500000)
         token_id = extract_virtual_mint_token_id(receipt, contract)
+
+        # Any CSAM screening ticket written above had no tokenId yet; attach
+        # it now so /csam/sweep can locate (and if needed take down) this
+        # exact post, same as run_mint_pipeline does post-mint.
+        if csam_ticket_id:
+            csam_screening.attach_ticket_linkage(firestore_db, csam_ticket_id, tokenId=str(token_id))
 
         # Upload 1080p HQ version to Firebase Storage
         hq_media_url = upload_to_firebase_storage(

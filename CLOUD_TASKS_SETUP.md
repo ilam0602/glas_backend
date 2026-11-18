@@ -100,6 +100,32 @@ match /mintJobs/{id} {
 (`mintResults/{id}` stays server-only as before. The temp upload bytes live under
 GCS `mint_uploads/…` and are deleted as soon as the job finishes.)
 
+## G. Stale-job sweep (Cloud Scheduler)
+A hard-killed `/mint/process` (OOM, crash, deploy mid-mint) can't mark its job
+failed, leaving `mintJobs/{id}` in `processing` forever — and the client card
+stuck on "Finishing". `POST /mint/sweep` flips any `queued`/`processing` job
+older than `STALE_MINT_JOB_MINUTES` (default 15) to `failed` and deletes its
+`mint_uploads/…` stash, so the app shows the tappable Failed card (repost /
+discard). Each `/mint/process` run also sweeps opportunistically, but a
+scheduled sweep clears stuck jobs even when nobody is posting:
+
+Console → **Cloud Scheduler → Create job**
+- Name: `mint-sweep`, Region: `us-central1`, Frequency: `*/10 * * * *`.
+- Target type: **HTTP**, URL: `https://<service>/mint/sweep`, Method: **POST**.
+- Auth header: **Add OIDC token**, service account `mint-invoker@…`, and set
+  **Audience** to the `/mint/process` URL (`TASKS_TARGET_URL`) — the server
+  verifies all worker OIDC tokens against that one audience.
+  (Alternative: no OIDC, add header `X-Mint-Secret: <MINT_WORKER_SECRET>`.)
+
+Or via gcloud:
+```
+gcloud scheduler jobs create http mint-sweep \
+  --location=us-central1 --schedule="*/10 * * * *" --http-method=POST \
+  --uri="https://glas-backend-486202920754.us-central1.run.app/mint/sweep" \
+  --oidc-service-account-email="mint-invoker@<project>.iam.gserviceaccount.com" \
+  --oidc-token-audience="https://glas-backend-486202920754.us-central1.run.app/mint/process"
+```
+
 ## Local dev note
 Locally there's no Cloud Tasks; set `MINT_WORKER_SECRET` and (the code supports)
 calling `/mint/process` directly with that secret header, or run the mint inline —
