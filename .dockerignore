@@ -7,3 +7,6 @@ __pycache__/
 .claude/
 .serena/
 CLAUDE.md
+# Full extracted PhotoDNA SDK (100MB+ of samples/docs) -- the image only gets
+# the trimmed photodna_sdk/ staging dir, which is deliberately NOT ignored.
+PhotoDNA.EdgeHashGeneration*

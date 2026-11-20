@@ -3,9 +3,12 @@ the quarantine -> incident -> admin-alert match path.
 
 See docs/specs/2026-10-09-csam-screening-quarantine-report-design.md for the
 full design and the legal rationale (18 U.S.C. 2258A preserve/report duties).
-This is Phase 1: one interim provider (WebPurify + its PhotoDNA add-on),
-manual NCMEC reporting, "disabled" by default so the feature ships dark
-until a vendor is signed and the account exists.
+Phase 1 providers: "photodna" (Microsoft PhotoDNA Cloud Service directly --
+account approved 2026-10, see docs/PHOTODNA_SETUP.md) and "webpurify"
+(WebPurify + its PhotoDNA add-on, the earlier interim plan). Manual NCMEC
+reporting; "disabled" by default so the feature ships dark until the
+remaining enablement steps (legal sign-off, API key, quarantine bucket,
+scheduler) are done.
 
 This module takes Firestore/GCS client handles as plain parameters rather
 than importing server.py, so it has zero import-time side effects (no live
@@ -29,6 +32,8 @@ from typing import Any, Callable, Optional
 import requests
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 
+import photodna_hash
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,6 +49,7 @@ CSAM_FAIL_MODE = os.getenv("CSAM_FAIL_MODE", "open")  # "open" | "closed"
 CSAM_QUARANTINE_BUCKET = os.getenv("CSAM_QUARANTINE_BUCKET", "glas-csam-quarantine")
 CSAM_RETENTION_DAYS = int(os.getenv("CSAM_RETENTION_DAYS", "120"))
 WEBPURIFY_API_KEY = os.getenv("WEBPURIFY_API_KEY")
+PHOTODNA_API_KEY = os.getenv("PHOTODNA_API_KEY")
 CSAM_MAX_VIDEO_FRAMES = int(os.getenv("CSAM_MAX_VIDEO_FRAMES", "60"))
 CSAM_POLL_SECONDS = int(os.getenv("CSAM_POLL_SECONDS", "20"))
 
@@ -83,20 +89,55 @@ WEBPURIFY_POLL_INTERVAL_SECONDS = 2
 WEBPURIFY_SIGNED_URL_TTL_SECONDS = 15 * 60
 WEBPURIFY_REQUEST_TIMEOUT_SECONDS = 10
 
+# ---------------------------------------------------------------------------
+# Microsoft PhotoDNA Cloud Service constants.
+#
+# VERIFIED from the PhotoDNA onboarding email (account approved 2026-10,
+# enablement confirmed 2026-11; console login isaacl@glassocial.com):
+#   - The service accepts PhotoDNA Edge Hashes ONLY, never raw images. Hashes
+#     are generated locally with Microsoft's EdgeHashGeneration SDK (see
+#     photodna_hash.py) -- irreversible, ~1KB each, so no imagery leaves the
+#     server on this provider.
+#   - Endpoint: POST https://api.microsoftmoderator.com/photodna/v1.0/MatchHash
+#   - Auth: "Ocp-Apim-Subscription-Key" request header (NOT a query param, so
+#     the key never appears in a URL; it is still covered by _redact_secrets
+#     as a backstop).
+#   - Body: JSON array of {"DataRepresentation": "PreHashV2", "Value": <hash>},
+#     up to 5 hashes per request (PHOTODNA_MAX_HASHES_PER_REQUEST -- video
+#     frames are batched accordingly).
+#   - Matching is SYNCHRONOUS: the response resolves every submitted hash, so
+#     this provider never produces a "pending" verdict and never writes
+#     csamScreenTickets.
+# Response envelope VERIFIED against the live service 2026-11-18 (via
+# verify_photodna.py with the real subscription key): a JSON object
+# {"TrackingId": ..., "MatchResults": [{"Status": {"Code": 3000, ...},
+# "IsMatch": bool, "MatchDetails": {"MatchFlags": [...]}, ...}]} -- the
+# {"MatchResults": [...]} shape in _photodna_match_results. The bare-list and
+# single-object shapes are kept as defensive tolerance only.
+# ---------------------------------------------------------------------------
+
+PHOTODNA_MATCH_URL = "https://api.microsoftmoderator.com/photodna/v1.0/MatchHash"
+PHOTODNA_DATA_REPRESENTATION = "PreHashV2"
+PHOTODNA_MAX_HASHES_PER_REQUEST = 5
+PHOTODNA_REQUEST_TIMEOUT_SECONDS = 15
+PHOTODNA_STATUS_OK_CODE = 3000  # Microsoft Moderator "OK" status code
+
 
 def _redact_secrets(text: str) -> str:
-    """Defensive backstop: strip the WebPurify API key out of any string bound
+    """Defensive backstop: strip provider API keys out of any string bound
     for a log line or a persisted provider_ref. WEBPURIFY_API_KEY is sent as a
     query param (the vendor's required auth shape -- see the WebPurify adapter
     below), so a requests exception's message embeds it in the request URL, and
     provider_ref is written to Firestore (csamIncidents/csamScreenTickets).
-    Never let the key reach either. Reads the module global at call time so it
-    honours a monkeypatched key in tests."""
+    PHOTODNA_API_KEY travels in a header (lower leak risk) but gets the same
+    treatment -- some APIs echo request headers back in error bodies. Never
+    let a key reach a log or Firestore. Reads the module globals at call time
+    so it honours monkeypatched keys in tests."""
     if not text:
         return text
-    key = WEBPURIFY_API_KEY
-    if key:
-        text = text.replace(key, "[REDACTED]")
+    for key in (WEBPURIFY_API_KEY, PHOTODNA_API_KEY):
+        if key:
+            text = text.replace(key, "[REDACTED]")
     return text
 
 
@@ -203,8 +244,9 @@ def screen_image_bytes(
     google-cloud-storage Bucket-like object (`.blob(path)` ->
     `.upload_from_string()`/`.delete()`), and `sign_url_fn(blob, method,
     expiration) -> str` mirrors server.py's `generate_signed_url`. Both are
-    ignored (never touched) when CSAM_SCREEN_PROVIDER is "disabled", so the
-    no-op path never requires real GCS wiring.
+    ignored (never touched) when CSAM_SCREEN_PROVIDER is "disabled" or
+    "photodna" (which hashes the bytes locally and only ever sends the
+    irreversible hash), so neither path requires real GCS wiring.
 
     `existing_blob_path`: when the exact `image_bytes` being screened already
     sit at this path in `gcs_bucket` (as the correct content-type, fetchable
@@ -216,6 +258,8 @@ def screen_image_bytes(
     provider = CSAM_SCREEN_PROVIDER
     if provider == "disabled":
         return _disabled_result()
+    if provider == "photodna":
+        return _screen_image_photodna(image_bytes, content_type)
     if provider == "webpurify":
         return _screen_image_webpurify(
             image_bytes, content_type, gcs_bucket, sign_url_fn, existing_blob_path
@@ -263,6 +307,12 @@ def screen_video_bytes(
             provider_ref={"reason": "no frames extracted"},
         )
 
+    if provider == "photodna":
+        # Dedicated path: MatchHash takes up to PHOTODNA_MAX_HASHES_PER_REQUEST
+        # hashes per call, so frames are batched (60 frames = 12 requests, not
+        # 60) and the per-frame screen_image_bytes loop below is skipped.
+        return _screen_video_photodna(frames)
+
     pending_frames = []
     screened = 0
     for index, frame_bytes in enumerate(frames):
@@ -300,7 +350,9 @@ def extract_pending_img_ids(screen_result: ScreenResult) -> list:
     """Pull the WebPurify ticket id(s) needed to later re-poll a "pending"
     ScreenResult: a single image's `imgId`, or a video's unresolved frames'
     `imgId`s. Isolates WebPurify's response shape inside this module so
-    server.py (the ticket writer) stays provider-agnostic."""
+    server.py (the ticket writer) stays provider-agnostic. (The "photodna"
+    provider is synchronous and never yields a "pending" verdict, so no
+    photodna ScreenResult ever reaches this.)"""
     ref = screen_result.provider_ref or {}
     if "pendingFrames" in ref:
         return [
@@ -310,6 +362,197 @@ def extract_pending_img_ids(screen_result: ScreenResult) -> list:
         ]
     img_id = ref.get("imgId")
     return [img_id] if img_id else []
+
+
+# ---------------------------------------------------------------------------
+# PhotoDNA Cloud Service adapter (direct, via Edge Hashes)
+# ---------------------------------------------------------------------------
+
+
+def _screen_image_photodna(image_bytes, content_type) -> ScreenResult:
+    """Screen one image against PhotoDNA: hash locally (photodna_hash), then
+    one synchronous MatchHash call. Never returns "pending" -- PhotoDNA
+    resolves every hash in the response."""
+    if not PHOTODNA_API_KEY:
+        return ScreenResult(
+            verdict="error", provider="photodna",
+            provider_ref={"reason": "PHOTODNA_API_KEY not configured"},
+        )
+
+    try:
+        edge_hash = photodna_hash.generate_edge_hash(image_bytes, content_type=content_type)
+    except Exception as e:
+        # Hash generation is fully local (no key involved), but redact
+        # defensively anyway before persisting/logging.
+        reason = _redact_secrets(f"edge hash generation failed: {e}")
+        logger.error("[csam] photodna %s", reason)
+        return ScreenResult(verdict="error", provider="photodna", provider_ref={"reason": reason})
+
+    try:
+        results = _photodna_match_hashes([edge_hash])
+    except Exception as e:
+        reason = _exc_reason(e)
+        logger.error("[csam] photodna MatchHash call failed: %s", reason)
+        return ScreenResult(verdict="error", provider="photodna", provider_ref={"reason": reason})
+
+    if len(results) != 1:
+        return ScreenResult(
+            verdict="error", provider="photodna",
+            provider_ref={
+                "reason": f"expected 1 MatchHash result, got {len(results)}",
+                "raw": _redact_payload(results),
+            },
+        )
+    result = results[0]
+    if not _photodna_result_status_ok(result):
+        return ScreenResult(
+            verdict="error", provider="photodna",
+            provider_ref={"reason": "non-OK result status", "raw": _redact_payload(result)},
+        )
+    if result.get("IsMatch"):
+        return ScreenResult(
+            verdict="known_match", provider="photodna",
+            provider_ref={"match": _redact_payload(result)},
+        )
+    return ScreenResult(verdict="clear", provider="photodna")
+
+
+def _screen_video_photodna(frames) -> ScreenResult:
+    """Screen already-extracted video frames against PhotoDNA: hash every
+    frame locally, then MatchHash in batches of PHOTODNA_MAX_HASHES_PER_REQUEST,
+    stopping at the first match (same early-exit semantics as the generic
+    per-frame loop in screen_video_bytes). Any single frame matching = the
+    whole video matches; no "pending" is possible."""
+    if not PHOTODNA_API_KEY:
+        return ScreenResult(
+            verdict="error", provider="photodna",
+            provider_ref={"reason": "PHOTODNA_API_KEY not configured"},
+        )
+
+    hashes = []
+    for index, frame_bytes in enumerate(frames):
+        try:
+            hashes.append(photodna_hash.generate_edge_hash(frame_bytes, content_type="image/jpeg"))
+        except Exception as e:
+            reason = _redact_secrets(f"edge hash generation failed: {e}")
+            logger.error("[csam] photodna frame %d %s", index, reason)
+            return ScreenResult(
+                verdict="error", provider="photodna",
+                provider_ref={"failedFrameIndex": index, "reason": reason},
+            )
+
+    screened = 0
+    for start in range(0, len(hashes), PHOTODNA_MAX_HASHES_PER_REQUEST):
+        batch = hashes[start:start + PHOTODNA_MAX_HASHES_PER_REQUEST]
+        try:
+            results = _photodna_match_hashes(batch)
+        except Exception as e:
+            reason = _exc_reason(e)
+            logger.error("[csam] photodna MatchHash call failed: %s", reason)
+            return ScreenResult(
+                verdict="error", provider="photodna",
+                provider_ref={"failedBatchStartFrame": start, "reason": reason},
+                frames_screened=screened,
+            )
+        if len(results) != len(batch):
+            return ScreenResult(
+                verdict="error", provider="photodna",
+                provider_ref={
+                    "failedBatchStartFrame": start,
+                    "reason": f"expected {len(batch)} MatchHash results, got {len(results)}",
+                    "raw": _redact_payload(results),
+                },
+                frames_screened=screened,
+            )
+        for offset, result in enumerate(results):
+            screened += 1
+            frame_index = start + offset
+            if not _photodna_result_status_ok(result):
+                return ScreenResult(
+                    verdict="error", provider="photodna",
+                    provider_ref={
+                        "failedFrameIndex": frame_index,
+                        "reason": "non-OK result status",
+                        "raw": _redact_payload(result),
+                    },
+                    frames_screened=screened,
+                )
+            if result.get("IsMatch"):
+                # frame_index is POSITIONAL (results assumed to come back in
+                # request order -- re-verify with a real response; even if the
+                # ordering assumption ever failed, the match verdict itself,
+                # which is what drives quarantine/report, is still correct).
+                return ScreenResult(
+                    verdict="known_match", provider="photodna",
+                    provider_ref={
+                        "matchedFrameIndex": frame_index,
+                        "match": _redact_payload(result),
+                    },
+                    frames_screened=screened,
+                )
+
+    return ScreenResult(verdict="clear", provider="photodna", frames_screened=screened)
+
+
+def _photodna_match_hashes(hashes: list) -> list:
+    """One MatchHash call for up to PHOTODNA_MAX_HASHES_PER_REQUEST edge
+    hashes. Returns the normalized per-hash result list (same order as
+    `hashes`). Raises on HTTP/parse failure -- callers map to an "error"
+    verdict via _exc_reason."""
+    if len(hashes) > PHOTODNA_MAX_HASHES_PER_REQUEST:
+        raise ValueError(
+            f"at most {PHOTODNA_MAX_HASHES_PER_REQUEST} hashes per MatchHash request"
+        )
+    payload = [
+        {"DataRepresentation": PHOTODNA_DATA_REPRESENTATION, "Value": h} for h in hashes
+    ]
+    resp = requests.post(
+        PHOTODNA_MATCH_URL,
+        headers={
+            "Ocp-Apim-Subscription-Key": PHOTODNA_API_KEY,
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=PHOTODNA_REQUEST_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    return _photodna_match_results(resp.json())
+
+
+def _photodna_match_results(payload) -> list:
+    """Normalize the MatchHash response envelope to a list of per-hash result
+    dicts. Accepts the plausible Microsoft Moderator shapes (exact envelope
+    unverified pre-key -- see the constants block above): a bare JSON array,
+    a {"MatchResults": [...]} wrapper, or a single result object with
+    "IsMatch" (single-hash request). Anything else raises."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        wrapped = payload.get("MatchResults")
+        if isinstance(wrapped, list):
+            return wrapped
+        if "IsMatch" in payload:
+            return [payload]
+    raise ValueError("unrecognized MatchHash response shape")
+
+
+def _photodna_result_status_ok(result) -> bool:
+    """Whether one per-hash result reports success. Microsoft Moderator
+    results carry {"Status": {"Code": 3000, "Description": "OK"}}; a missing
+    Status block is tolerated (shape unverified), any explicit non-3000 code
+    is a per-hash failure the caller turns into an "error" verdict."""
+    if not isinstance(result, dict):
+        return False
+    status = result.get("Status")
+    if not isinstance(status, dict):
+        return True
+    code = status.get("Code")
+    if code is None:
+        return True
+    try:
+        return int(code) == PHOTODNA_STATUS_OK_CODE
+    except (TypeError, ValueError):
+        return False
 
 
 # ---------------------------------------------------------------------------

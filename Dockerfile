@@ -16,11 +16,20 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
 COPY csam_screening.py .
+COPY photodna_hash.py .
 COPY economy_v2.py .
 COPY payout_provider.py .
 COPY AuthenSnap.json .
 COPY Token.json .
 COPY Glas.json .
+
+# PhotoDNA EdgeHash SDK (licensed, NOT in git). In the cloudbuild.yaml flow
+# the fetch-photodna-sdk step fills photodna_sdk/ from the private GCS bucket
+# before this build; from a bare checkout the dir holds only its committed
+# README, which still builds -- the photodna screening provider then reports
+# "SDK not configured" instead of crashing (feature ships dark either way).
+COPY photodna_sdk /app/photodna_sdk
+ENV PHOTODNA_SDK_DIR=/app/photodna_sdk
 
 EXPOSE 8080
 

@@ -1,0 +1,83 @@
+# Cloud Build: fetch PhotoDNA SDK -> build -> push -> deploy glas-backend.
+#
+# Based on ~/.claude/templates/cloudbuild.yaml, adapted for this service:
+#   - fetch-photodna-sdk: pulls the trimmed, licensed (non-redistributable,
+#     never-in-git) PhotoDNA EdgeHash SDK from the private GCS bucket into the
+#     workspace so the Dockerfile's `COPY photodna_sdk` bakes it into the
+#     image. Fails LOUDLY if the bucket/layout is wrong -- a silent SDK-less
+#     image would make the photodna screening provider error at runtime.
+#   - No private-pip get-token/secret steps: requirements.txt is public-PyPI
+#     only, and this Dockerfile predates the template (no secret mount).
+#   - Deploy passes ONLY image/region/platform: glas-backend's env vars,
+#     secrets, memory, timeout, and service account are managed in the Cloud
+#     Run console and MUST persist across deploys (same behavior as the
+#     previous console "Dockerfile" build-type trigger).
+#
+# To activate: Cloud Build -> Triggers -> the glas-backend trigger -> edit ->
+# Configuration type: "Cloud Build configuration file" -> /cloudbuild.yaml.
+# Until the trigger is switched, this file is inert and pushes keep using the
+# plain-Dockerfile build (which still works -- photodna_sdk/ then only
+# contains its committed README, so images simply ship without the SDK).
+steps:
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: fetch-photodna-sdk
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        set -e
+        rm -rf photodna_sdk
+        mkdir -p photodna_sdk
+        gsutil -m rsync -r "gs://${_PHOTODNA_SDK_BUCKET}/photodna_sdk" photodna_sdk
+        # Sanity-check the layout photodna_hash.py resolves at runtime.
+        test -d photodna_sdk/clientlibrary/python/PhotoDna
+        ls photodna_sdk/clientlibrary/libEdgeHashGenerator*.so.* >/dev/null
+  - name: gcr.io/cloud-builders/docker
+    id: Build
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        DOCKER_BUILDKIT=1 docker build \
+          -t $_AR_HOSTNAME/$PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA \
+          -f Dockerfile \
+          .
+  - name: gcr.io/cloud-builders/docker
+    id: Push
+    args:
+      - push
+      - >-
+        $_AR_HOSTNAME/$PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: Deploy
+    entrypoint: gcloud
+    # `run deploy` creates the service on first run and updates it after.
+    # Flags beyond image/region are deliberately omitted so the service's
+    # existing (console-managed) configuration is inherited unchanged.
+    args:
+      - run
+      - deploy
+      - $_SERVICE_NAME
+      - '--platform=managed'
+      - >-
+        --image=$_AR_HOSTNAME/$PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
+      - >-
+        --labels=managed-by=gcp-cloud-build-deploy-cloud-run,commit-sha=$COMMIT_SHA,gcb-build-id=$BUILD_ID,gcb-trigger-id=$_TRIGGER_ID
+      - '--region=$_DEPLOY_REGION'
+      - '--quiet'
+images:
+  - >-
+    $_AR_HOSTNAME/$PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
+options:
+  substitutionOption: ALLOW_LOOSE
+  logging: CLOUD_LOGGING_ONLY
+substitutions:
+  _AR_HOSTNAME: us-central1-docker.pkg.dev
+  _AR_REPOSITORY: cloud-run-source-deploy
+  _SERVICE_NAME: glas-backend
+  _DEPLOY_REGION: us-central1
+  _PHOTODNA_SDK_BUCKET: glas-photodna-sdk
+tags:
+  - gcp-cloud-build-deploy-cloud-run
+  - gcp-cloud-build-deploy-cloud-run-managed
+  - glas-backend

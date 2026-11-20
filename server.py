@@ -798,7 +798,11 @@ def cancel_pending_transactions():
 
         latest_block = w3.eth.get_block("latest")
         base_fee = latest_block["baseFeePerGas"]
-        max_priority_fee = w3.to_wei(50, "gwei")
+        # Cancellations must outbid the stuck tx's tip to replace it, so this
+        # stays above get_gas_params()'s 2-gwei tip -- but 50 gwei was Sepolia
+        # overkill for a 21k-gas self-transfer; 10 gwei replaces anything the
+        # mint path now produces.
+        max_priority_fee = w3.to_wei(10, "gwei")
         max_fee = (base_fee * 5) + max_priority_fee
 
         cancelled_txs = []
@@ -1607,12 +1611,20 @@ def extract_virtual_mint_token_id(receipt, contract):
 
 
 def get_gas_params():
-    """Get aggressive EIP-1559 gas parameters."""
+    """Get EIP-1559 gas parameters: a modest tip plus a 5x-base-fee cap.
+
+    The cap matters beyond what a tx actually pays: nodes reject a tx unless
+    the sender balance covers gas_limit * maxFeePerGas up front. The previous
+    600-gwei floor made a ~1.7M-gas mint demand a >1 ETH reserve and bounced
+    mints with -32003 "insufficient funds" on a well-funded wallet, and the
+    30-gwei tip burned ~0.04 ETH per mint on a near-zero-base-fee Sepolia.
+    base_fee * 5 still adapts automatically if the network spikes.
+    """
     latest_block = w3.eth.get_block("latest")
     base_fee = latest_block["baseFeePerGas"]
-    max_priority_fee = w3.to_wei(30, "gwei")
+    max_priority_fee = w3.to_wei(2, "gwei")
     max_fee = (base_fee * 5) + max_priority_fee
-    min_max_fee = w3.to_wei(600, "gwei")
+    min_max_fee = w3.to_wei(40, "gwei")
     max_fee = max(max_fee, min_max_fee)
     return max_fee, max_priority_fee
 
