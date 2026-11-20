@@ -2,3 +2,12 @@
 venv/
 __pycache__/
 *.pyc
+
+# Microsoft PhotoDNA EdgeHash SDK -- licensed, non-redistributable
+# (docs/PHOTODNA_SETUP.md). photodna_sdk/ is the trimmed build-time staging
+# dir (scripts/stage_photodna_sdk.sh fills it locally; cloudbuild.yaml fills
+# it from GCS); only its placeholder README is committed so bare-checkout
+# docker builds keep working.
+photodna_sdk/*
+!photodna_sdk/README.md
+PhotoDNA.EdgeHashGeneration*

@@ -1499,3 +1499,367 @@ def test_screen_image_existing_blob_path_sign_failure_is_error(webpurify_enabled
 
     assert result.verdict == "error"
     assert bucket.deleted == []
+
+
+# ---------------------------------------------------------------------------
+# PhotoDNA provider (direct Microsoft Cloud Service via Edge Hashes)
+# ---------------------------------------------------------------------------
+
+
+FAKE_EDGE_HASH_PREFIX = "UEROQQ"
+
+
+def _fake_edge_hash(image_bytes, content_type="image/jpeg"):
+    return f"{FAKE_EDGE_HASH_PREFIX}-hash-of-{image_bytes.decode()}"
+
+
+@pytest.fixture
+def photodna_enabled(monkeypatch):
+    monkeypatch.setattr(csam_screening, "CSAM_SCREEN_PROVIDER", "photodna")
+    monkeypatch.setattr(csam_screening, "PHOTODNA_API_KEY", "pdna-secret-key")
+    monkeypatch.setattr(
+        csam_screening.photodna_hash, "generate_edge_hash", _fake_edge_hash
+    )
+
+
+def make_photodna_post(match_hash_indices=(), envelope="list", status_code=200,
+                       result_status_code=3000):
+    """Fake `requests.post` for MatchHash. Tracks the global order of hashes
+    across calls so `match_hash_indices` can target any frame regardless of
+    which batch it lands in. `envelope` exercises the tolerated response
+    shapes: "list" (bare array) or "wrapped" ({"MatchResults": [...]})."""
+    calls = []
+    seen = {"count": 0}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append({"url": url, "headers": dict(headers or {}), "payload": json})
+        results = []
+        for _item in json:
+            idx = seen["count"]
+            seen["count"] += 1
+            results.append({
+                "IsMatch": idx in match_hash_indices,
+                "Status": {"Code": result_status_code, "Description": "OK"},
+                "MatchDetails": {"MatchFlags": []},
+            })
+        body = results if envelope == "list" else {"MatchResults": results}
+        return FakeHttpResponse(body, status_code=status_code)
+
+    fake_post.calls = calls
+    return fake_post
+
+
+def test_photodna_image_clear_sends_prehash_payload(monkeypatch, photodna_enabled):
+    fake_post = make_photodna_post()
+    monkeypatch.setattr(csam_screening.requests, "post", fake_post)
+
+    result = csam_screening.screen_image_bytes(b"img", "image/jpeg", {"uid": "u1"})
+
+    assert result.verdict == "clear"
+    assert result.provider == "photodna"
+    assert len(fake_post.calls) == 1
+    call = fake_post.calls[0]
+    assert call["url"] == csam_screening.PHOTODNA_MATCH_URL
+    assert call["headers"]["Ocp-Apim-Subscription-Key"] == "pdna-secret-key"
+    assert call["payload"] == [
+        {"DataRepresentation": "PreHashV2", "Value": _fake_edge_hash(b"img")}
+    ]
+
+
+def test_photodna_image_match_bare_list_envelope(monkeypatch, photodna_enabled):
+    monkeypatch.setattr(
+        csam_screening.requests, "post", make_photodna_post(match_hash_indices={0})
+    )
+    result = csam_screening.screen_image_bytes(b"img", "image/jpeg", {})
+    assert result.verdict == "known_match"
+    assert result.is_match
+    assert result.provider_ref["match"]["IsMatch"] is True
+
+
+def test_photodna_image_match_wrapped_envelope(monkeypatch, photodna_enabled):
+    monkeypatch.setattr(
+        csam_screening.requests, "post",
+        make_photodna_post(match_hash_indices={0}, envelope="wrapped"),
+    )
+    result = csam_screening.screen_image_bytes(b"img", "image/jpeg", {})
+    assert result.verdict == "known_match"
+
+
+def test_photodna_single_object_envelope_is_parsed():
+    results = csam_screening._photodna_match_results({"IsMatch": False, "Status": {"Code": 3000}})
+    assert len(results) == 1 and results[0]["IsMatch"] is False
+
+
+def test_photodna_unrecognized_envelope_raises():
+    with pytest.raises(ValueError):
+        csam_screening._photodna_match_results({"something": "else"})
+
+
+def test_photodna_missing_api_key_is_error(monkeypatch):
+    monkeypatch.setattr(csam_screening, "CSAM_SCREEN_PROVIDER", "photodna")
+    monkeypatch.setattr(csam_screening, "PHOTODNA_API_KEY", None)
+    result = csam_screening.screen_image_bytes(b"img", "image/jpeg", {})
+    assert result.verdict == "error"
+    assert "PHOTODNA_API_KEY" in result.provider_ref["reason"]
+
+
+def test_photodna_hash_generation_failure_is_error(monkeypatch, photodna_enabled):
+    def _boom(image_bytes, content_type="image/jpeg"):
+        raise csam_screening.photodna_hash.PhotoDNAHashError("SDK not configured")
+
+    monkeypatch.setattr(csam_screening.photodna_hash, "generate_edge_hash", _boom)
+    result = csam_screening.screen_image_bytes(b"img", "image/jpeg", {})
+    assert result.verdict == "error"
+    assert "edge hash generation failed" in result.provider_ref["reason"]
+
+
+def test_photodna_http_error_is_error_and_key_never_leaks(monkeypatch, photodna_enabled, caplog):
+    def _http_boom(url, headers=None, json=None, timeout=None):
+        raise requests.ConnectionError(
+            "boom calling https://api.microsoftmoderator.com with key pdna-secret-key"
+        )
+
+    monkeypatch.setattr(csam_screening.requests, "post", _http_boom)
+    with caplog.at_level("ERROR"):
+        result = csam_screening.screen_image_bytes(b"img", "image/jpeg", {})
+    assert result.verdict == "error"
+    leaked = json.dumps(result.provider_ref) + caplog.text
+    assert "pdna-secret-key" not in leaked
+
+
+def test_photodna_non_ok_result_status_is_error(monkeypatch, photodna_enabled):
+    monkeypatch.setattr(
+        csam_screening.requests, "post", make_photodna_post(result_status_code=3206)
+    )
+    result = csam_screening.screen_image_bytes(b"img", "image/jpeg", {})
+    assert result.verdict == "error"
+    assert result.provider_ref["reason"] == "non-OK result status"
+
+
+def test_photodna_missing_status_block_is_tolerated():
+    assert csam_screening._photodna_result_status_ok({"IsMatch": False}) is True
+    assert csam_screening._photodna_result_status_ok({"IsMatch": False, "Status": {"Code": 3000}}) is True
+    assert csam_screening._photodna_result_status_ok({"Status": {"Code": 3208}}) is False
+    assert csam_screening._photodna_result_status_ok("not-a-dict") is False
+
+
+def test_photodna_match_hashes_rejects_oversized_batch(monkeypatch, photodna_enabled):
+    with pytest.raises(ValueError):
+        csam_screening._photodna_match_hashes(["h"] * 6)
+
+
+def test_photodna_video_batches_five_hashes_per_request(monkeypatch, photodna_enabled):
+    frames = [f"f{i}".encode() for i in range(12)]
+    monkeypatch.setattr(csam_screening, "_extract_video_frames", lambda vb: frames)
+    fake_post = make_photodna_post()
+    monkeypatch.setattr(csam_screening.requests, "post", fake_post)
+
+    result = csam_screening.screen_video_bytes(b"video", "video/mp4", {})
+
+    assert result.verdict == "clear"
+    assert result.frames_screened == 12
+    assert [len(c["payload"]) for c in fake_post.calls] == [5, 5, 2]
+
+
+def test_photodna_video_match_reports_frame_index_and_stops_early(monkeypatch, photodna_enabled):
+    frames = [f"f{i}".encode() for i in range(12)]
+    monkeypatch.setattr(csam_screening, "_extract_video_frames", lambda vb: frames)
+    fake_post = make_photodna_post(match_hash_indices={7})
+    monkeypatch.setattr(csam_screening.requests, "post", fake_post)
+
+    result = csam_screening.screen_video_bytes(b"video", "video/mp4", {})
+
+    assert result.verdict == "known_match"
+    assert result.provider_ref["matchedFrameIndex"] == 7
+    assert result.frames_screened == 8
+    assert len(fake_post.calls) == 2  # third batch never sent
+
+
+def test_photodna_video_frame_hash_failure_is_error(monkeypatch, photodna_enabled):
+    frames = [b"f0", b"f1"]
+    monkeypatch.setattr(csam_screening, "_extract_video_frames", lambda vb: frames)
+
+    def _boom_on_f1(image_bytes, content_type="image/jpeg"):
+        if image_bytes == b"f1":
+            raise csam_screening.photodna_hash.PhotoDNAHashError("bad frame")
+        return _fake_edge_hash(image_bytes, content_type)
+
+    monkeypatch.setattr(csam_screening.photodna_hash, "generate_edge_hash", _boom_on_f1)
+    result = csam_screening.screen_video_bytes(b"video", "video/mp4", {})
+    assert result.verdict == "error"
+    assert result.provider_ref["failedFrameIndex"] == 1
+
+
+def test_photodna_video_result_count_mismatch_is_error(monkeypatch, photodna_enabled):
+    frames = [b"f0", b"f1"]
+    monkeypatch.setattr(csam_screening, "_extract_video_frames", lambda vb: frames)
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return FakeHttpResponse([{"IsMatch": False, "Status": {"Code": 3000}}])  # 1 for 2
+
+    monkeypatch.setattr(csam_screening.requests, "post", fake_post)
+    result = csam_screening.screen_video_bytes(b"video", "video/mp4", {})
+    assert result.verdict == "error"
+    assert "expected 2" in result.provider_ref["reason"]
+
+
+def test_photodna_never_produces_pending_ticket_ids(monkeypatch, photodna_enabled):
+    monkeypatch.setattr(csam_screening.requests, "post", make_photodna_post())
+    result = csam_screening.screen_image_bytes(b"img", "image/jpeg", {})
+    assert result.verdict == "clear"
+    assert csam_screening.extract_pending_img_ids(result) == []
+
+
+def test_redact_secrets_covers_photodna_key(monkeypatch):
+    monkeypatch.setattr(csam_screening, "PHOTODNA_API_KEY", "pdna-secret-key")
+    monkeypatch.setattr(csam_screening, "WEBPURIFY_API_KEY", "wp-key")
+    out = csam_screening._redact_secrets("a pdna-secret-key b wp-key c")
+    assert out == "a [REDACTED] b [REDACTED] c"
+
+
+
+# ---------------------------------------------------------------------------
+# photodna_hash (in-process EdgeHashGenerator wrapper). The real native SDK
+# is exercised only by the opt-in integration test at the bottom (it is
+# licensed, not in git, and absent on CI); everything else fakes
+# _get_generator.
+# ---------------------------------------------------------------------------
+
+import io as _io
+import os as _os
+import types as _types
+
+from PIL import Image as _PILImage
+
+import photodna_hash
+
+
+def _image_bytes(mode="RGB", size=(4, 3)):
+    buf = _io.BytesIO()
+    _PILImage.new(mode, size).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _install_fake_generator(monkeypatch, hash_value=b"UEROQQ" + b"C" * 300):
+    """Replace _get_generator with a fake module (int option/size constants
+    mirroring the SDK enums) + a fake generator that records the native-call
+    args and writes `hash_value` into the output buffer."""
+    fake_module = _types.SimpleNamespace(
+        PhotoDnaOptions=_types.SimpleNamespace(
+            Rgb=0x0, Rgba=0x100, Cmyk=0x300, HashFormatEdgeV2Base64=0x90
+        ),
+        HashSize=_types.SimpleNamespace(
+            EdgeV2Base64=_types.SimpleNamespace(value=0x4D0)
+        ),
+    )
+    calls = []
+
+    class FakeGenerator:
+        def PhotoDnaEdgeHash(self, pixel_buffer, hash_buffer, width, height, stride, options):
+            calls.append({
+                "nbytes": len(pixel_buffer), "width": width, "height": height,
+                "stride": stride, "options": options,
+            })
+            hash_buffer.value = hash_value
+            return 0
+
+    monkeypatch.setattr(
+        photodna_hash, "_get_generator", lambda: (fake_module, FakeGenerator())
+    )
+    return calls
+
+
+def test_photodna_hash_unconfigured_sdk_raises_clear_error(monkeypatch):
+    monkeypatch.setattr(photodna_hash, "PHOTODNA_SDK_DIR", None)
+    assert photodna_hash.is_sdk_configured() is False
+    with pytest.raises(photodna_hash.PhotoDNAHashError, match="PHOTODNA_SDK_DIR"):
+        photodna_hash.generate_edge_hash(_image_bytes())
+
+
+def test_photodna_hash_sdk_dir_without_clientlibrary_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr(photodna_hash, "PHOTODNA_SDK_DIR", str(tmp_path))
+    assert photodna_hash.is_sdk_configured() is False
+    with pytest.raises(photodna_hash.PhotoDNAHashError, match="clientlibrary"):
+        photodna_hash.generate_edge_hash(_image_bytes())
+
+
+def test_photodna_hash_rgb_image_happy_path(monkeypatch):
+    expected = b"UEROQQ" + b"C" * 300
+    calls = _install_fake_generator(monkeypatch, hash_value=expected)
+
+    result = photodna_hash.generate_edge_hash(_image_bytes("RGB", (4, 3)))
+
+    assert result == expected.decode()
+    assert len(calls) == 1
+    call = calls[0]
+    assert (call["width"], call["height"], call["stride"]) == (4, 3, 0)
+    assert call["nbytes"] == 4 * 3 * 3  # RGB = 3 bytes/pixel
+    assert call["options"] & 0x90  # HashFormatEdgeV2Base64 requested
+
+
+def test_photodna_hash_rgba_image_uses_rgba_layout(monkeypatch):
+    calls = _install_fake_generator(monkeypatch)
+    photodna_hash.generate_edge_hash(_image_bytes("RGBA", (4, 3)))
+    assert calls[0]["nbytes"] == 4 * 3 * 4  # RGBA = 4 bytes/pixel
+    assert calls[0]["options"] & 0x100  # Rgba pixel-layout flag
+
+
+def test_photodna_hash_grayscale_converts_to_rgb(monkeypatch):
+    calls = _install_fake_generator(monkeypatch)
+    photodna_hash.generate_edge_hash(_image_bytes("L", (4, 3)))
+    assert calls[0]["nbytes"] == 4 * 3 * 3  # converted to RGB
+
+def test_photodna_hash_undecodable_bytes_raise(monkeypatch):
+    _install_fake_generator(monkeypatch)
+    with pytest.raises(photodna_hash.PhotoDNAHashError, match="failed to decode"):
+        photodna_hash.generate_edge_hash(b"not an image at all")
+
+
+def test_photodna_hash_native_call_failure_raises(monkeypatch):
+    fake_module = _types.SimpleNamespace(
+        PhotoDnaOptions=_types.SimpleNamespace(
+            Rgb=0x0, Rgba=0x100, Cmyk=0x300, HashFormatEdgeV2Base64=0x90
+        ),
+        HashSize=_types.SimpleNamespace(
+            EdgeV2Base64=_types.SimpleNamespace(value=0x4D0)
+        ),
+    )
+
+    class BoomGenerator:
+        def PhotoDnaEdgeHash(self, *a, **kw):
+            raise RuntimeError("native error -3")
+
+    monkeypatch.setattr(
+        photodna_hash, "_get_generator", lambda: (fake_module, BoomGenerator())
+    )
+    with pytest.raises(photodna_hash.PhotoDNAHashError, match="computation failed"):
+        photodna_hash.generate_edge_hash(_image_bytes())
+
+
+def test_photodna_hash_output_without_magic_prefix_raises(monkeypatch):
+    _install_fake_generator(monkeypatch, hash_value=b"garbage-not-a-hash")
+    with pytest.raises(photodna_hash.PhotoDNAHashError, match="does not look like"):
+        photodna_hash.generate_edge_hash(_image_bytes())
+
+
+# Opt-in integration test against the REAL licensed SDK (never on CI; also
+# skipped locally unless explicitly requested, because an unapproved native
+# library can hang the process inside macOS Gatekeeper instead of failing).
+# Run with:  RUN_PHOTODNA_SDK_TESTS=1 python -m pytest test_csam_screening.py -k real_sdk
+_REAL_SDK_DIR = _os.path.join(
+    _os.path.dirname(_os.path.abspath(__file__)), "PhotoDNA.EdgeHashGeneration-1.05.009"
+)
+
+
+@pytest.mark.skipif(
+    not _os.environ.get("RUN_PHOTODNA_SDK_TESTS")
+    or not _os.path.isdir(_REAL_SDK_DIR),
+    reason="real-SDK test is opt-in (RUN_PHOTODNA_SDK_TESTS=1) and needs the SDK on disk",
+)
+def test_photodna_hash_real_sdk_generates_valid_hash(monkeypatch):
+    monkeypatch.setattr(photodna_hash, "PHOTODNA_SDK_DIR", _REAL_SDK_DIR)
+    image_path = _os.path.join(_REAL_SDK_DIR, "samples", "TestImages", "img_130.jpg")
+    with open(image_path, "rb") as f:
+        edge_hash = photodna_hash.generate_edge_hash(f.read())
+    assert edge_hash.startswith(photodna_hash.EDGE_HASH_PREFIX)
+    assert len(edge_hash) > 1000  # Edge V2 base64 is ~1.2KB

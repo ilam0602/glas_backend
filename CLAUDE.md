@@ -83,7 +83,20 @@ compressed/pinned/minted, plus a `POST /csam/sweep` route (same
 Cloud-Scheduler auth as `/mint/sweep`) that reconciles pending vendor tickets
 and purges retention-expired quarantine evidence.
 
-- `CSAM_SCREEN_PROVIDER` — `disabled` (default) | `webpurify`.
+- `CSAM_SCREEN_PROVIDER` — `disabled` (default) | `photodna` | `webpurify`.
+- `PHOTODNA_API_KEY` — Microsoft PhotoDNA Cloud Service subscription key
+  (photodna provider only; account approved 2026-10, console login
+  isaacl@glassocial.com; key + response envelope verified live 2026-11-18).
+  PhotoDNA receives only locally-generated, irreversible Edge Hashes — never
+  images — and matches synchronously (no pending tickets). See
+  `docs/PHOTODNA_SETUP.md` + `verify_photodna.py`.
+- `PHOTODNA_SDK_DIR` — path to the extracted (non-redistributable, NOT in
+  git — gitignored) EdgeHashGeneration SDK, e.g.
+  `PhotoDNA.EdgeHashGeneration-1.05.009/`. `photodna_hash.py` loads the
+  SDK's python client library + native `libEdgeHashGenerator` IN-PROCESS
+  (lazy, once per process); macOS note: the unsigned dylib needs Gatekeeper
+  approval the first time (quarantine xattr cleared + ad-hoc codesigned +
+  "Allow Anyway" in System Settings).
 - `CSAM_FAIL_MODE` — `open` (default: proceed + log CRITICAL on a provider
   error) | `closed` (abort the upload with the generic error).
 - `CSAM_QUARANTINE_BUCKET` — GCS bucket for quarantined evidence (default
